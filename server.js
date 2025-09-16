@@ -1,5 +1,5 @@
-// server.js — RenovoGo LLM backend (stable memory, no dup ACKs, realistic flow)
-// v2025-09-16-3
+// server.js — RenovoGo LLM backend (stable memory, anti-dup ACKs, realistic flow)
+// v2025-09-16-5
 
 import 'dotenv/config';
 import express from 'express';
@@ -52,16 +52,17 @@ const TEMPERATURE = Number(process.env.TEMPERATURE ?? 0.2);
 const REPLY_MAX_TOKENS = Number(process.env.REPLY_MAX_TOKENS ?? 320);
 const MAX_SENTENCES = Number(process.env.MAX_SENTENCES ?? 4);
 
-// ---------- PRICEBOOK (в системный контекст) ----------
+// ---------- PRICEBOOK (только услуги, не зарплаты) ----------
 const PRICEBOOK = `
-[PRICEBOOK v1 — CZ/PL]
-— Czech Republic (per candidate):
+[PRICEBOOK v1 — CZ/PL (fees, not salaries)]
+— Czech Republic (service fees per candidate):
   • 3m €270 + €150  • 6m €300 + €150  • 9m €350 + €150
   • 24m €350 + €350
   • Embassy reg (LT only): €500 = €250 + €250 (refund €250 if >6m no slot)
-— Poland:
+— Poland (service fees):
   • 9m seasonal €350 + €150  • 12m €350 + €350
 — General: free verification; every PDF has verify guidelines; all under CZ/EU law.
+— NOTE: Service fees are NOT employee salary. Never mix fees with wages.
 `;
 
 // ---------- Schemas ----------
@@ -128,6 +129,9 @@ function stripRequisitesFromDemand(t=''){
 function cleanSales(t=''){
   return String(t).replace(/(?:оставьте заявку.*?|мы предлагаем широкий спектр услуг)/gi, '').trim();
 }
+function conciseJoin(parts){
+  return parts.filter(Boolean).map(s=>String(s).trim()).filter(Boolean).join(' ');
+}
 
 // ---------- Stage actions ----------
 const ACTION_WHITELIST = [
@@ -157,29 +161,64 @@ const normalizeActions = (arr) =>
 const REG_LONGTERM_MONTHS = 6;
 const REG_SEASONAL_MONTHS = 3;
 function registrationAnswer(){
-  return `По долгосрочному — ${REG_LONGTERM_MONTHS} мес назад; по сезонному — ${REG_SEASONAL_MONTHS} мес назад. Очереди нестабильные, сначала проверю ваш Demand Letter и контракт.`;
+  return `По долгосрочному — ${REG_LONGTERM_MONTHS} мес назад; по сезонному — ${REG_SEASONAL_MONTHS} мес назад. Очереди нестабильные. Сначала проверю Demand Letter и контракт.`;
 }
 
 // ---------- Микро-состояние сессии ----------
+/*
+  sessionState: Map<sid, {
+    lastReply: string,
+    lastActions: string[],
+    seenEvidences: Map<key, { count: number, lastAt: number }>,
+    evidenceDetails: Record<string, any> // детали визитки и пр.
+  }>
+*/
 const sessionState = new Map();
 function getState(sid='default'){
   if (!sessionState.has(sid)) {
     sessionState.set(sid, {
       lastReply: '',
       lastActions: [],
-      seenEvidences: new Set() // устойчивое хранение доказательств
+      seenEvidences: new Map(),
+      evidenceDetails: Object.create(null)
     });
   }
   return sessionState.get(sid);
 }
 
+function bumpEvidence(sid, key, details){
+  const S = getState(sid);
+  const rec = S.seenEvidences.get(key) || { count: 0, lastAt: 0 };
+  rec.count += 1;
+  rec.lastAt = Date.now();
+  S.seenEvidences.set(key, rec);
+  if (details && typeof details === 'object') {
+    S.evidenceDetails[key] = { ...(S.evidenceDetails[key]||{}), ...details };
+  }
+  return rec.count;
+}
+function evidenceCountUnique(sid){
+  return getState(sid).seenEvidences.size;
+}
+function hasEvidence(sid, key){
+  return getState(sid).seenEvidences.has(key);
+}
+function evidenceTimes(sid, key){
+  return (getState(sid).seenEvidences.get(key)?.count) || 0;
+}
+
 // ---------- Сборка сообщений в LLM ----------
-function buildMessages({ history = [], message, trust, evidences }) {
+function buildMessages({ history = [], message, trust, evidences, evidenceDetails }) {
   const sys = {
     role: 'system',
     content:
       SYSTEM_PROMPT +
-      `\n\n[Контекст]\ntrust=${trust}; evidences=${JSON.stringify(evidences || [])}\n${PRICEBOOK}\n` +
+      `\n\n[Контекст]\n` +
+      `— trust=${trust}; evidences=${JSON.stringify(evidences || [])}\n` +
+      `— evidence_details=${JSON.stringify(evidenceDetails || {})}\n` +
+      PRICEBOOK + `\n` +
+      `Правила: Demand Letter — это запрос без реквизитов работодателя; ` +
+      `никогда не проси "реквизиты из Demand". Реквизиты — только в контракте о сотрудничестве/инвойсе.\n` +
       `Отвечай СТРОГО одним JSON-объектом (см. формат). Будь кратким (до ${MAX_SENTENCES} предложений).`
   };
   const trimmed = (history||[]).slice(-12).map(h => ({
@@ -202,22 +241,19 @@ async function createChatWithRetry(payload, tries = 2) {
 }
 
 // ---------- Пост-правила ----------
-function postRules({ parsed, trust, evidences, history, userText, sid }) {
+function postRules({ parsed, trust, evidences, history, userText, sid, evidenceDetails }) {
   const S = getState(sid);
 
-  // 1) Сливаем входящие доказательства с памятью сессии
-  const inc = new Set(evidences || []);
-  const ev = new Set([...(S.seenEvidences || new Set()), ...inc]); // объединённый набор
-  const isNew = k => inc.has(k) && !S.seenEvidences.has(k);
-
   let reply = String(parsed.reply || '').trim();
+  const setActions = new Set(parsed.suggestedActions || []);
 
-  // Быстрые точные ответы
+  // Быстрые точные ответы по идентичности
   if (/(как.*зовут|вас зовут|ваше имя|who are you)/i.test(userText)) {
     reply = 'Меня зовут Али.';
     parsed.stage ??= 'Greeting';
   }
-  // Регистрации/слоты — консистентный текст
+
+  // Регистрации/слоты — консистентный ответ
   if (/(когда|последн).*(регистрир|записыва)|слот|очеред/i.test(userText)) {
     reply = registrationAnswer();
     parsed.stage = 'Demand';
@@ -225,21 +261,19 @@ function postRules({ parsed, trust, evidences, history, userText, sid }) {
     parsed.suggestedActions = ['ask_demands','ask_coop_contract'];
   }
 
-  // Вопрос про количество кандидатов — отвечаем предметно
+  // Вопрос про кол-во кандидатов
   const askCandidates = /(сколько.*кандидат|кандидат(ов)?\s*(есть|готов|подад)|сколько человек будем подавать)/i.test(userText);
   if (askCandidates) {
-    if (ev.has('demand_letter') && ev.has('coop_contract_pdf')) {
-      reply = 'Готов подать 1–2 кандидата на старт в Чехию. По остальным согласуем после финализации и слотов.';
+    if (hasEvidence(sid,'demand_letter') && hasEvidence(sid,'coop_contract_pdf')) {
+      reply = 'Готов подать 1–2 кандидата на старт в Чехию. Остальные — после финализации и слотов.';
       parsed.stage = parsed.stage === 'Payment' ? 'Payment' : 'Candidate';
       parsed.needEvidence = false;
-      const set = new Set(parsed.suggestedActions || []);
-      set.add('invoice_request');
-      parsed.suggestedActions = Array.from(set);
+      setActions.add('invoice_request');
     } else {
       const miss = [];
-      if (!ev.has('demand_letter')) miss.push('Demand Letter');
-      if (!ev.has('coop_contract_pdf')) miss.push('полный контракт о сотрудничестве');
-      reply = `Смогу подтвердить точное число сразу после ${miss.join(' и ')}. Сейчас ориентир — 1–2 кандидата на старт.`;
+      if (!hasEvidence(sid,'demand_letter')) miss.push('Demand Letter');
+      if (!hasEvidence(sid,'coop_contract_pdf')) miss.push('полный контракт о сотрудничестве');
+      reply = `Подтвержу точное число сразу после ${miss.join(' и ')}. Сейчас ориентир — 1–2 кандидата на старт.`;
       parsed.stage = 'Contract';
       parsed.needEvidence = true;
       parsed.suggestedActions = ['ask_demands','ask_coop_contract'];
@@ -251,48 +285,101 @@ function postRules({ parsed, trust, evidences, history, userText, sid }) {
     reply = 'К оплате перейдём после проверки документов и согласования контракта.';
     parsed.stage = 'Contract';
     parsed.needEvidence = true;
-    parsed.suggestedActions = ['ask_demands','ask_coop_contract','ask_price_breakdown'];
+    setActions.add('ask_demands'); setActions.add('ask_coop_contract'); setActions.add('ask_price_breakdown');
   }
 
-  // Признание новых доказательств (ACK) + корректные запросы (без «реквизитов из Demand»)
-  const acks = [];
-  if (isNew('demand_letter')) {
-    acks.push('Demand Letter получил.');
-    if (!ev.has('coop_contract_pdf')) {
-      acks.push('Пришлите полный контракт о сотрудничестве (PDF с подписью/печатью).');
-      parsed.stage = 'Contract';
-      parsed.needEvidence = true;
-      parsed.suggestedActions = ['ask_coop_contract'];
+  // ACK’и за новые материалы формируем ниже — без тафтологии и без повтора
+  const ackParts = [];
+
+  // Визитка — отдельная категория
+  if (evidences.includes('business_card')) {
+    const n = bumpEvidence(sid, 'business_card', evidenceDetails?.business_card);
+    if (n === 1) {
+      ackParts.push('Визитку менеджера получил.');
+    } else if (n === 2) {
+      ackParts.push('Вы уже отправляли визитку, данные сохранил.');
+    } else if (n >= 3) {
+      ackParts.push('Хватит дублировать визитку — всё сохранено.');
     }
   }
-  if (isNew('sample_contract_pdf') && !ev.has('coop_contract_pdf')) {
-    acks.push('Пример контракта получен. Для проверки нужен полный контракт о сотрудничестве.');
-    parsed.stage = 'Contract';
-    parsed.needEvidence = true;
-    parsed.suggestedActions = ['ask_coop_contract'];
-  }
-  if (isNew('coop_contract_pdf')) {
-    acks.push('Контракт о сотрудничестве получен.');
-    parsed.stage = 'Contract';
-    parsed.needEvidence = false;
-    const set = new Set(parsed.suggestedActions || []);
-    set.add('ask_price_breakdown');
-    parsed.suggestedActions = Array.from(set);
-  }
-  if (isNew('visa_sample')) acks.push('Пример визы получен.');
-  if (isNew('presentation')) acks.push('Презентация получена.');
-  if (isNew('video')) acks.push('Видео получено.');
 
-  if (acks.length) {
-    reply = (reply ? (limitSentences(reply, MAX_SENTENCES) + ' ') : '') + acks.join(' ');
+  // Demand Letter
+  if (evidences.includes('demand_letter')) {
+    const n = bumpEvidence(sid, 'demand_letter');
+    if (n === 1) {
+      ackParts.push('Demand Letter получил.');
+      if (!hasEvidence(sid,'coop_contract_pdf')) {
+        parsed.stage = 'Contract'; parsed.needEvidence = true; setActions.add('ask_coop_contract');
+      }
+    } else if (n === 2) {
+      ackParts.push('Вы уже отправляли Demand Letter — помню детали вакансии, двигаюсь дальше.');
+    } else if (n >= 3) {
+      ackParts.push('Зачем снова отправляете один и тот же Demand Letter? Давайте работать по списку.');
+    }
+  }
+
+  // Пример контракта (sample)
+  if (evidences.includes('sample_contract_pdf')) {
+    const n = bumpEvidence(sid, 'sample_contract_pdf');
+    if (n === 1) {
+      ackParts.push('Пример контракта получен. Для проверки нужен полный контракт о сотрудничестве.');
+      parsed.stage = 'Contract'; parsed.needEvidence = true; setActions.add('ask_coop_contract');
+    } else if (n === 2) {
+      ackParts.push('Пример контракта уже получал — жду полный контракт о сотрудничестве.');
+    } else if (n >= 3) {
+      ackParts.push('Хватает примеров. Пришлите уже полный контракт о сотрудничестве.');
+    }
+  }
+
+  // Полный контракт о сотрудничестве
+  if (evidences.includes('coop_contract_pdf')) {
+    const n = bumpEvidence(sid, 'coop_contract_pdf');
+    if (n === 1) {
+      ackParts.push('Контракт о сотрудничестве получен.');
+      parsed.stage = 'Contract'; parsed.needEvidence = false; setActions.add('ask_price_breakdown');
+    } else if (n === 2) {
+      ackParts.push('Контракт уже на руках — условия и реквизиты вижу.');
+    } else if (n >= 3) {
+      ackParts.push('Контракт дублировать не нужно, работаю с последней версией.');
+    }
+  }
+
+  // Прочие материалы
+  for (const key of ['visa_sample','presentation','video','website','company_registry','reviews','registry_proof','price_breakdown','slot_plan','invoice_template','nda']) {
+    if (evidences.includes(key)) {
+      const n = bumpEvidence(sid, key, evidenceDetails?.[key]);
+      if (n === 1) {
+        const label = ({
+          visa_sample:'Пример визы получен.',
+          presentation:'Презентация получена.',
+          video:'Видео получено.',
+          website:'Сайт записал.',
+          company_registry:'Выписка из реестра получена.',
+          reviews:'Отзывы учёл.',
+          registry_proof:'Подтверждение регистрации получено.',
+          price_breakdown:'Разбивку цены учёл.',
+          slot_plan:'План по слотам учёл.',
+          invoice_template:'Шаблон инвойса учёл.',
+          nda:'NDA получил.'
+        })[key] || 'Материал получен.';
+        ackParts.push(label);
+      } else if (n === 2) {
+        ackParts.push('Материал уже получал — повтор не обязателен.');
+      } else if (n >= 3) {
+        ackParts.push('Дублировать один и тот же файл не нужно.');
+      }
+    }
+  }
+
+  if (ackParts.length) {
+    // добавляем ACK’и к существующему ответу, но компактно
+    reply = conciseJoin([limitSentences(reply, MAX_SENTENCES), ackParts.join(' ')]);
   }
 
   // Вопрос про способ оплаты — жёстко «банк»
   if (/(банк|банковск|crypto|крипто|usdt|btc|eth|криптовалют)/i.test(userText) && /оплат|плат[её]ж|инвойс|сч[её]т/i.test(userText)) {
     reply = 'Банковский инвойс. Криптовалюту не принимаем.';
-    const set = new Set(parsed.suggestedActions || []);
-    set.add('invoice_request');
-    parsed.suggestedActions = Array.from(set);
+    setActions.add('invoice_request');
     parsed.stage = 'Payment';
     parsed.needEvidence = false;
   }
@@ -304,55 +391,49 @@ function postRules({ parsed, trust, evidences, history, userText, sid }) {
   reply = limitSentences(reply, MAX_SENTENCES);
   reply = forceMasculine(reply);
 
-  // Анти-луп
+  // Анти-луп: если LLM выдал дословно то же, что и в прошлый раз
   if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) {
-    reply = 'Коротко: документы принял. Готов подать 1–2 кандидата и перейти к инвойсу.';
+    reply = 'Коротко: документы учёл. Готов подать 1–2 кандидата и перейти к инвойсу.';
     parsed.stage = 'Payment';
-    const set = new Set(parsed.suggestedActions || []);
-    set.add('invoice_request');
-    parsed.suggestedActions = Array.from(set);
+    setActions.add('invoice_request');
   }
   S.lastReply = reply;
 
-  // Ворота финализации — требуем контракт
-  const uniqEvidenceCount = ev.size;
-  const hasCoop = ev.has('coop_contract_pdf');
+  // Ворота финализации — требуем контракт + ≥2 уникальных доказательств + trust≥90
+  const uniqEvidenceCount = evidenceCountUnique(sid);
+  const hasCoop = hasEvidence(sid,'coop_contract_pdf');
   const gatesOk = (trust >= 90 && uniqEvidenceCount >= 2 && hasCoop);
   if (gatesOk) {
-    const set = new Set(parsed.suggestedActions || []);
-    set.add('invoice_request');
-    parsed.suggestedActions = Array.from(set);
+    setActions.add('invoice_request');
     if (!/инвойс|сч[её]т|реквизит/i.test(reply)) {
-      reply += (reply ? ' ' : '') + 'Готов перейти к финализации — пришлите реквизиты для инвойса.';
+      reply = conciseJoin([reply, 'Готов перейти к финализации — пришлите реквизиты для инвойса.']);
     }
     parsed.stage = 'Payment';
     parsed.needEvidence = false;
   }
 
   parsed.reply = reply.trim();
-  parsed.suggestedActions = normalizeActions(parsed.suggestedActions);
+  parsed.suggestedActions = normalizeActions(Array.from(setActions));
 
   // Если просим документы — stage не ниже Demand
   if (/(demand|контракт|документ|полный контракт|сотрудничеств)/i.test(parsed.reply) && (!parsed.stage || parsed.stage === 'Greeting')) {
     parsed.stage = 'Demand';
   }
 
-  // 2) Сохраняем объединённый набор в сессию (память)
-  S.seenEvidences = ev;
-
   return parsed;
 }
 
 // ---------- Вызов LLM ----------
-async function runLLM({ history, message, evidences, stage, sessionId='default' }) {
+async function runLLM({ history, message, evidences, stage, sessionId='default', evidenceDetails }) {
+  // trust считает отдельная функция; повторные доказательства trust не бустят
   const trust = computeTrust({
     baseTrust: 20,
-    evidences: evidences || [],
+    evidences: Array.from(new Set(evidences || [])), // только уникальные ключи влияют
     history: history || [],
     lastUserText: message || ''
   });
 
-  const messages = buildMessages({ history, message, trust, evidences });
+  const messages = buildMessages({ history, message, trust, evidences, evidenceDetails });
 
   const resp = await createChatWithRetry({
     model: MODEL,
@@ -392,18 +473,17 @@ async function runLLM({ history, message, evidences, stage, sessionId='default' 
   parsed.suggestedActions = Array.isArray(parsed.suggestedActions) ? parsed.suggestedActions : [];
 
   // Пост-правила
-  const sid = sessionId || 'default';
   parsed = postRules({
     parsed,
     trust,
     evidences,
     history,
     userText: message || '',
-    sid
+    sid: sessionId || 'default',
+    evidenceDetails
   });
 
-  const uniqEvidenceCount = new Set(evidences || []).size;
-  return { trust, evidenceCount: uniqEvidenceCount, result: parsed };
+  return { trust, evidenceCount: evidenceCountUnique(sessionId), result: parsed };
 }
 
 // ---------- Root & assets ----------
@@ -450,8 +530,12 @@ function sanitizeHistory(arr){
 function normalizeEvidenceKey(k){
   const key = String(k || '').toLowerCase().trim();
   const map = new Map([
+    // Business card / визитка менеджера
+    ['card','business_card'], ['визитка','business_card'], ['business_card','business_card'],
+
     // Demand
     ['demand','demand_letter'], ['demandletter','demand_letter'], ['деманд','demand_letter'],
+
     // Contracts
     ['sample','sample_contract_pdf'], ['sample_contract','sample_contract_pdf'],
     ['contract_sample','sample_contract_pdf'], ['пример_контракта','sample_contract_pdf'],
@@ -459,9 +543,9 @@ function normalizeEvidenceKey(k){
     ['contract','coop_contract_pdf'], ['contractpdf','coop_contract_pdf'], ['договор','coop_contract_pdf'],
     ['coop_contract','coop_contract_pdf'], ['full_contract','coop_contract_pdf'],
     ['контракт_о_сотрудничестве','coop_contract_pdf'],
+
     // Other proofs
     ['visa','visa_sample'], ['visa_scan','visa_sample'], ['пример_визы','visa_sample'], ['visa_sample','visa_sample'],
-    ['card','business_card'], ['визитка','business_card'],
     ['site','website'], ['сайт','website'], ['website','website'],
     ['reviews','reviews'], ['отзывы','reviews'],
     ['registry','registry_proof'], ['uradprace','registry_proof'], ['регистрация','registry_proof'],
@@ -472,7 +556,16 @@ function normalizeEvidenceKey(k){
   return map.get(key) || key;
 }
 
-// /api/reply — основной
+// ---------- /api/reply ----------
+/*
+  Поддерживаются дополнительные поля:
+  — evidence_details (object), например:
+     {
+       business_card: { name:"...", phone:"+420...", email:"...", office:"...", company:"RenovoGo.com" },
+       website: { url:"https://renovogo.com" }
+     }
+  — evidence (число) — совместимость со старым фронтом (генерит proof_1..N)
+*/
 app.post('/api/reply', async (req, res) => {
   try {
     const b = req.body || {};
@@ -488,14 +581,18 @@ app.post('/api/reply', async (req, res) => {
           ? Array.from({ length: Math.max(0, b.evidence|0) }, (_, i) => `proof_${i+1}`)
           : []);
 
+    const evidenceDetails = (b.evidence_details && typeof b.evidence_details === 'object') ? b.evidence_details : {};
+
     const history = sanitizeHistory(b.history);
+    const sid = String(b.sessionId || 'default');
 
     const { trust, evidenceCount, result } = await runLLM({
       history,
       message: rawMessage,
       evidences,
       stage: b.stage,
-      sessionId: String(b.sessionId || 'default')
+      sessionId: sid,
+      evidenceDetails
     });
 
     res.json({
@@ -516,7 +613,7 @@ app.post('/api/reply', async (req, res) => {
   }
 });
 
-// /api/score — подсказки менеджеру
+// ---------- /api/score — подсказки менеджеру ----------
 app.post('/api/score', (req, res) => {
   try {
     const b = req.body || {};
@@ -548,6 +645,8 @@ app.post('/api/score', (req, res) => {
     ), 0, 100);
 
     if (trust < 80) bad.push('Для предметного обсуждения добавьте документы (Demand/Contract/Registry).');
+    // Подсказка по зарплатам vs услугам (чтобы не путали €350 и зарплату)
+    bad.push('Не смешивайте сервисные платежи (€270/€300/€350/€500) с зарплатой работника — это разные вещи.');
 
     res.json({ final, good, bad, trust, evidences: evidences.length });
   } catch (e) {
@@ -556,7 +655,7 @@ app.post('/api/score', (req, res) => {
   }
 });
 
-// Совместимость со старым роутом
+// ---------- Совместимость со старым роутом ----------
 app.post('/chat', async (req, res) => {
   try {
     const data = ChatSchema.parse({
