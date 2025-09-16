@@ -62,7 +62,6 @@ function buildMessages({ history = [], message, trust, evidences }) {
 }
 
 async function runLLM({ history, message, evidences }) {
-  // trust на основе истории и «доков»
   const trust = computeTrust({
     baseTrust: 30,
     evidences: evidences || [],
@@ -74,7 +73,7 @@ async function runLLM({ history, message, evidences }) {
   const resp = await groq.chat.completions.create({
     model: MODEL,
     temperature: 0.5,
-    response_format: { type: 'json_object' }, // строгий JSON на выходе
+    response_format: { type: 'json_object' }, // строгий JSON
     messages
   });
 
@@ -92,7 +91,7 @@ async function runLLM({ history, message, evidences }) {
     };
   }
 
-  // Форсируем финализацию при достаточном доверии
+  // Принудительная логика финализации
   const evidenceCount = new Set(evidences || []).size;
   if (trust >= 90 && evidenceCount >= 2) {
     if (!Array.isArray(parsed.suggestedActions) || !parsed.suggestedActions.includes('invoice_request')) {
@@ -110,6 +109,38 @@ async function runLLM({ history, message, evidences }) {
   return { trust, evidenceCount, result: parsed };
 }
 
+// ---------- Заглушки для корня и иконок (чтобы не было 404 в логах) ----------
+app.get('/', (_, res) => {
+  res.type('html').send(`<!doctype html>
+<meta charset="utf-8">
+<title>Renovogo LLM Backend</title>
+<style>body{font:14px system-ui;margin:40px;color:#0b1220}</style>
+<h1>Renovogo LLM Backend</h1>
+<p>OK. Use <code>/api/reply</code>, <code>/api/score</code>, <code>/api/ping</code>.</p>`);
+});
+
+app.get('/favicon.ico', (req, res) => {
+  // пустой 1×1 ICO
+  const emptyIco = Buffer.from(
+    'AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' +
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'base64'
+  );
+  res.set('Content-Type', 'image/x-icon');
+  res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  res.send(emptyIco);
+});
+
+app.get(['/apple-touch-icon.png','/apple-touch-icon-precomposed.png'], (req, res) => {
+  // прозрачный 1×1 PNG
+  const emptyPng = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAoMBg7rj2/8AAAAASUVORK5CYII=',
+    'base64'
+  );
+  res.type('png');
+  res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  res.send(emptyPng);
+});
+
 // ---------- Твои исходные роуты ----------
 app.post('/chat', async (req, res) => {
   try {
@@ -119,7 +150,6 @@ app.post('/chat', async (req, res) => {
       message: data.message,
       evidences: data.evidences
     });
-
     res.json({ ok: true, trust, evidenceCount, result });
   } catch (e) {
     console.error(e);
@@ -137,7 +167,7 @@ app.post('/api/reply', async (req, res) => {
   try {
     const b = req.body || {};
 
-    // Приводим формат к ChatSchema
+    // Нормализация под ChatSchema
     const evidences =
       Array.isArray(b.evidences) ? b.evidences :
       (Number.isFinite(b.evidence) ? Array.from({ length: Math.max(0, b.evidence|0) }, (_, i) => `proof_${i+1}`) :
@@ -155,14 +185,16 @@ app.post('/api/reply', async (req, res) => {
       history
     };
 
-    const parsed = ChatSchema.partial({ stage: true }).parse(dataForLLM); // допускаем отсутствие stage
+    // допускаем отсутствие stage
+    const parsed = ChatSchema.partial({ stage: true }).parse(dataForLLM);
+
     const { trust, evidenceCount, result } = await runLLM({
       history: parsed.history,
       message: parsed.message,
       evidences: parsed.evidences
     });
 
-    // Ответ в формате, который ждёт front/chat.js
+    // Ответ для фронта
     res.json({
       text: result.reply || 'Слушаю вас.',
       agent: { name: 'Али', avatar: 'https://renovogo.com/welcome/assets/ali.png' },
@@ -175,7 +207,7 @@ app.post('/api/reply', async (req, res) => {
   }
 });
 
-// /api/score — простой скоринг по истории + «докам»
+// /api/score — простой скоринг
 app.post('/api/score', (req, res) => {
   try {
     const b = req.body || {};
@@ -186,7 +218,7 @@ app.post('/api/score', (req, res) => {
     const history = Array.isArray(b.history) ? b.history : [];
 
     const trust = computeTrust({ baseTrust: 30, evidences, history: [] });
-    const msgText = history.filter(h => h.role === 'user').map(h => h.content || '').join('\n').toLowerCase();
+    const msgText = history.filter(h => h.role === 'user').map(h => h.content || '').join('\n');
 
     const good = [];
     const bad  = [];
@@ -196,13 +228,12 @@ app.post('/api/score', (req, res) => {
     if (evidences.length >= 2) good.push('Приложили 2+ доказательства'); else bad.push('Мало доказательств (визитка/документы)');
     if (/(контракт|сч[её]т|инвойс|готовы начать)/i.test(msgText)) good.push('Есть финальный CTA'); else bad.push('Нет финального CTA');
 
-    // Простая итоговая оценка
     const final = Math.max(0, Math.min(100,
       Math.round(
-        ( (/(здрав|прив|добрый)/i.test(msgText)) ? 20 : 0 ) +
-        ( (/renovogo|renovogo\.com/i.test(msgText)) ? 20 : 0 ) +
-        ( (evidences.length >= 2) ? 30 : 0 ) +
-        ( (/(контракт|сч[её]т|инвойс|готовы начать)/i.test(msgText)) ? 30 : 0 )
+        (/(здрав|прив|добрый)/i.test(msgText) ? 20 : 0) +
+        (/renovogo|renovogo\.com/i.test(msgText) ? 20 : 0) +
+        ((evidences.length >= 2) ? 30 : 0) +
+        (/(контракт|сч[её]т|инвойс|готовы начать)/i.test(msgText) ? 30 : 0)
       )
     ));
 
