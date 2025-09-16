@@ -1,5 +1,5 @@
 // server.js — RenovoGo LLM backend (stable memory, anti-dup ACKs, realistic flow)
-// v2025-09-16-5
+// v2025-09-16-6 (fix: count only NEW evidences per request)
 
 import 'dotenv/config';
 import express from 'express';
@@ -52,7 +52,7 @@ const TEMPERATURE = Number(process.env.TEMPERATURE ?? 0.2);
 const REPLY_MAX_TOKENS = Number(process.env.REPLY_MAX_TOKENS ?? 320);
 const MAX_SENTENCES = Number(process.env.MAX_SENTENCES ?? 4);
 
-// ---------- PRICEBOOK (только услуги, не зарплаты) ----------
+// ---------- PRICEBOOK (fees, not salaries) ----------
 const PRICEBOOK = `
 [PRICEBOOK v1 — CZ/PL (fees, not salaries)]
 — Czech Republic (service fees per candidate):
@@ -170,7 +170,7 @@ function registrationAnswer(){
     lastReply: string,
     lastActions: string[],
     seenEvidences: Map<key, { count: number, lastAt: number }>,
-    evidenceDetails: Record<string, any> // детали визитки и пр.
+    evidenceDetails: Record<string, any>
   }>
 */
 const sessionState = new Map();
@@ -202,9 +202,6 @@ function evidenceCountUnique(sid){
 }
 function hasEvidence(sid, key){
   return getState(sid).seenEvidences.has(key);
-}
-function evidenceTimes(sid, key){
-  return (getState(sid).seenEvidences.get(key)?.count) || 0;
 }
 
 // ---------- Сборка сообщений в LLM ----------
@@ -244,10 +241,13 @@ async function createChatWithRetry(payload, tries = 2) {
 function postRules({ parsed, trust, evidences, history, userText, sid, evidenceDetails }) {
   const S = getState(sid);
 
+  // Новые пруфы ТОЛЬКО в этом запросе (исключаем то, что уже хранится в сессии)
+  const inc = new Set((evidences || []).filter(k => !S.seenEvidences.has(k)));
+
   let reply = String(parsed.reply || '').trim();
   const setActions = new Set(parsed.suggestedActions || []);
 
-  // Быстрые точные ответы по идентичности
+  // Быстрые точные ответы
   if (/(как.*зовут|вас зовут|ваше имя|who are you)/i.test(userText)) {
     reply = 'Меня зовут Али.';
     parsed.stage ??= 'Greeting';
@@ -288,65 +288,61 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     setActions.add('ask_demands'); setActions.add('ask_coop_contract'); setActions.add('ask_price_breakdown');
   }
 
-  // ACK’и за новые материалы формируем ниже — без тафтологии и без повтора
-  const ackParts = [];
+  // ACK’и — только для НОВЫХ материалов (или для визитки при новых деталях)
+  const acks = [];
 
-  // Визитка — отдельная категория
-  if (evidences.includes('business_card')) {
+  // Визитка: новая или обновлённые details
+  if (inc.has('business_card') || (evidenceDetails && evidenceDetails.business_card)) {
     const n = bumpEvidence(sid, 'business_card', evidenceDetails?.business_card);
-    if (n === 1) {
-      ackParts.push('Визитку менеджера получил.');
-    } else if (n === 2) {
-      ackParts.push('Вы уже отправляли визитку, данные сохранил.');
-    } else if (n >= 3) {
-      ackParts.push('Хватит дублировать визитку — всё сохранено.');
-    }
+    if (n === 1) acks.push('Визитку менеджера получил.');
+    else if (n === 2) acks.push('Вы уже отправляли визитку, данные сохранил.');
+    else if (n >= 3) acks.push('Хватит дублировать визитку — всё сохранено.');
   }
 
-  // Demand Letter
-  if (evidences.includes('demand_letter')) {
+  // Demand Letter — только если новый
+  if (inc.has('demand_letter')) {
     const n = bumpEvidence(sid, 'demand_letter');
     if (n === 1) {
-      ackParts.push('Demand Letter получил.');
+      acks.push('Demand Letter получил.');
       if (!hasEvidence(sid,'coop_contract_pdf')) {
         parsed.stage = 'Contract'; parsed.needEvidence = true; setActions.add('ask_coop_contract');
       }
     } else if (n === 2) {
-      ackParts.push('Вы уже отправляли Demand Letter — помню детали вакансии, двигаюсь дальше.');
+      acks.push('Вы уже отправляли Demand Letter — помню детали вакансии, двигаюсь дальше.');
     } else if (n >= 3) {
-      ackParts.push('Зачем снова отправляете один и тот же Demand Letter? Давайте работать по списку.');
+      acks.push('Зачем снова отправляете один и тот же Demand Letter? Давайте работать по списку.');
     }
   }
 
-  // Пример контракта (sample)
-  if (evidences.includes('sample_contract_pdf')) {
+  // Пример контракта — только если новый
+  if (inc.has('sample_contract_pdf')) {
     const n = bumpEvidence(sid, 'sample_contract_pdf');
     if (n === 1) {
-      ackParts.push('Пример контракта получен. Для проверки нужен полный контракт о сотрудничестве.');
+      acks.push('Пример контракта получен. Для проверки нужен полный контракт о сотрудничестве.');
       parsed.stage = 'Contract'; parsed.needEvidence = true; setActions.add('ask_coop_contract');
     } else if (n === 2) {
-      ackParts.push('Пример контракта уже получал — жду полный контракт о сотрудничестве.');
+      acks.push('Пример контракта уже получал — жду полный контракт о сотрудничестве.');
     } else if (n >= 3) {
-      ackParts.push('Хватает примеров. Пришлите уже полный контракт о сотрудничестве.');
+      acks.push('Хватает примеров. Пришлите уже полный контракт о сотрудничестве.');
     }
   }
 
-  // Полный контракт о сотрудничестве
-  if (evidences.includes('coop_contract_pdf')) {
+  // Полный контракт — только если новый
+  if (inc.has('coop_contract_pdf')) {
     const n = bumpEvidence(sid, 'coop_contract_pdf');
     if (n === 1) {
-      ackParts.push('Контракт о сотрудничестве получен.');
+      acks.push('Контракт о сотрудничестве получен.');
       parsed.stage = 'Contract'; parsed.needEvidence = false; setActions.add('ask_price_breakdown');
     } else if (n === 2) {
-      ackParts.push('Контракт уже на руках — условия и реквизиты вижу.');
+      acks.push('Контракт уже на руках — условия и реквизиты вижу.');
     } else if (n >= 3) {
-      ackParts.push('Контракт дублировать не нужно, работаю с последней версией.');
+      acks.push('Контракт дублировать не нужно, работаю с последней версией.');
     }
   }
 
-  // Прочие материалы
+  // Прочие материалы — только новые
   for (const key of ['visa_sample','presentation','video','website','company_registry','reviews','registry_proof','price_breakdown','slot_plan','invoice_template','nda']) {
-    if (evidences.includes(key)) {
+    if (inc.has(key)) {
       const n = bumpEvidence(sid, key, evidenceDetails?.[key]);
       if (n === 1) {
         const label = ({
@@ -362,21 +358,20 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
           invoice_template:'Шаблон инвойса учёл.',
           nda:'NDA получил.'
         })[key] || 'Материал получен.';
-        ackParts.push(label);
+        acks.push(label);
       } else if (n === 2) {
-        ackParts.push('Материал уже получал — повтор не обязателен.');
+        acks.push('Материал уже получал — повтор не обязателен.');
       } else if (n >= 3) {
-        ackParts.push('Дублировать один и тот же файл не нужно.');
+        acks.push('Дублировать один и тот же файл не нужно.');
       }
     }
   }
 
-  if (ackParts.length) {
-    // добавляем ACK’и к существующему ответу, но компактно
-    reply = conciseJoin([limitSentences(reply, MAX_SENTENCES), ackParts.join(' ')]);
+  if (acks.length) {
+    reply = conciseJoin([limitSentences(reply, MAX_SENTENCES), acks.join(' ')]);
   }
 
-  // Вопрос про способ оплаты — жёстко «банк»
+  // Способ оплаты — только банк
   if (/(банк|банковск|crypto|крипто|usdt|btc|eth|криптовалют)/i.test(userText) && /оплат|плат[её]ж|инвойс|сч[её]т/i.test(userText)) {
     reply = 'Банковский инвойс. Криптовалюту не принимаем.';
     setActions.add('invoice_request');
@@ -384,14 +379,14 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     parsed.needEvidence = false;
   }
 
-  // Убираем продажные клише/реквизиты из Demand/дубли и правим род
+  // Санитария текста
   reply = stripRequisitesFromDemand(reply);
   reply = dedupeSentences(reply);
   reply = cleanSales(reply);
   reply = limitSentences(reply, MAX_SENTENCES);
   reply = forceMasculine(reply);
 
-  // Анти-луп: если LLM выдал дословно то же, что и в прошлый раз
+  // Анти-луп
   if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) {
     reply = 'Коротко: документы учёл. Готов подать 1–2 кандидата и перейти к инвойсу.';
     parsed.stage = 'Payment';
@@ -399,7 +394,7 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   }
   S.lastReply = reply;
 
-  // Ворота финализации — требуем контракт + ≥2 уникальных доказательств + trust≥90
+  // Ворота финализации — требуем контракт + ≥2 уникальных пруфа + trust≥90
   const uniqEvidenceCount = evidenceCountUnique(sid);
   const hasCoop = hasEvidence(sid,'coop_contract_pdf');
   const gatesOk = (trust >= 90 && uniqEvidenceCount >= 2 && hasCoop);
@@ -425,7 +420,6 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
 
 // ---------- Вызов LLM ----------
 async function runLLM({ history, message, evidences, stage, sessionId='default', evidenceDetails }) {
-  // trust считает отдельная функция; повторные доказательства trust не бустят
   const trust = computeTrust({
     baseTrust: 20,
     evidences: Array.from(new Set(evidences || [])), // только уникальные ключи влияют
@@ -558,12 +552,9 @@ function normalizeEvidenceKey(k){
 
 // ---------- /api/reply ----------
 /*
-  Поддерживаются дополнительные поля:
+  Доп. поля:
   — evidence_details (object), например:
-     {
-       business_card: { name:"...", phone:"+420...", email:"...", office:"...", company:"RenovoGo.com" },
-       website: { url:"https://renovogo.com" }
-     }
+     { business_card: { name, phone, email, office, company }, website:{ url } }
   — evidence (число) — совместимость со старым фронтом (генерит proof_1..N)
 */
 app.post('/api/reply', async (req, res) => {
@@ -613,7 +604,7 @@ app.post('/api/reply', async (req, res) => {
   }
 });
 
-// ---------- /api/score — подсказки менеджеру ----------
+// ---------- /api/score ----------
 app.post('/api/score', (req, res) => {
   try {
     const b = req.body || {};
@@ -645,7 +636,6 @@ app.post('/api/score', (req, res) => {
     ), 0, 100);
 
     if (trust < 80) bad.push('Для предметного обсуждения добавьте документы (Demand/Contract/Registry).');
-    // Подсказка по зарплатам vs услугам (чтобы не путали €350 и зарплату)
     bad.push('Не смешивайте сервисные платежи (€270/€300/€350/€500) с зарплатой работника — это разные вещи.');
 
     res.json({ final, good, bad, trust, evidences: evidences.length });
