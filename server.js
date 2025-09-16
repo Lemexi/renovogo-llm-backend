@@ -317,6 +317,23 @@ function fixGuaranteeStoryText(t=''){
     .replace(/100%\s*гарант\w+/gi, '«гарантию» (что само по себе подозрительно)');
 }
 
+/* ── Лёгкий детектор интентов (NLU-lite) ── */
+function detectIntent(userText=''){
+  const t = String(userText).toLowerCase();
+
+  if (/(когда|последн(ий|ый)|дата).*(регист|слот|посольств|запис)/i.test(t)) return 'ask_registration';
+  if (/(слот|очеред|термин|запис)/i.test(t)) return 'ask_slots';
+  if (/(что\s+нужно|какие\s+документ\w*\s+нужн|что\s+прислать)/i.test(t)) return 'ask_docs';
+  if (/(цена|стоим|сколько\s+стоит|прайс|fee|€|eur|czk)/i.test(t)) return 'ask_price';
+  if (/(кандидат\w+).*(сколько|есть|доступн)/i.test(t)) return 'ask_candidates';
+  if (/(локац|город|место|location)/i.test(t)) return 'ask_location';
+  if (/(жиль|accommodat|общежит|проживан)/i.test(t)) return 'ask_accommodation';
+  if (/(график|час(ов)?\s*в\s*месяц|смен|working\s*hours|work\s*time)/i.test(t)) return 'ask_hours';
+  if (/(что\s+делать|обязан|описани[ея]\s+работ|job\s*description)/i.test(t)) return 'ask_job';
+
+  return null;
+}
+
 /* ──────────────────────────────────────────────────────────────
    ЧАСТЬ 4. СТАДИИ, КОНСТАНТЫ, ПРИВЕТСТВИЕ
    ────────────────────────────────────────────────────────────── */
@@ -482,7 +499,7 @@ function repetitionGuard(reply, sid){
   return out.join(' ');
 }
 
-/* ──────────────────────────────────────────────────────────────
+//* ──────────────────────────────────────────────────────────────
    ЧАСТЬ 5.1. POST-RULES (главная логика «клиента»)
    ────────────────────────────────────────────────────────────── */
 
@@ -526,11 +543,10 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   const S = getState(sid);
   S.turn = (S.turn || 0) + 1;
 
-  // 0) Нормализуем вход: редиректор «контракт работодателя» → B2B
+  // 0) Нормализуем вход
   userText = redirectEmployerContractToCoop(userText);
-
-  // Какие новые вложения пришли в ЭТОМ сообщении — важно для анти-приветствия
   const inc = new Set((evidences || []).filter(k => !S.seenEvidences.has(k)));
+  const intent = detectIntent(userText);
 
   let reply = String(parsed.reply || '').trim();
   const setActions = new Set(parsed.suggestedActions || []);
@@ -541,14 +557,14 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     parsed.stage ??= 'Greeting';
   }
 
-  // Регистрации/слоты — коротко по делу
-  if (/(когда|последн).*(регистрир|записыва)|слот|очеред/i.test(userText)) {
+  // Регистрация/слоты — по делу
+  if (intent === 'ask_registration' || intent === 'ask_slots') {
     reply = registrationAnswer();
     parsed.stage = 'Demand';
     parsed.needEvidence = false;
   }
 
-  // Greeting только на самом первом ходе и только если нет новых вложений
+  // Greeting только на первом ходе и без вложений
   const isFirstTurn = (S.turn === 1);
   if (isFirstTurn && inc.size === 0 && (!parsed.stage || parsed.stage === 'Greeting')) {
     reply = craftHumanGreeting({ base: reply, userText, sid });
@@ -557,23 +573,18 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     reply = rewriteVacancyQuestionToSupplierRole(reply);
   }
 
-  // DEMAND-факты — отвечаем только если менеджер спросил
+  // DEMAND-факты — если менеджер спросил
   const DF = getDemandFacts(sid);
-  const askedSalary = /(зарплат|salary|сколько.*(получ|net))/i.test(userText);
-  const askedHouse  = /(жиль|accommodat|общежит|проживан)/i.test(userText);
-  const askedHours  = /(график|час(ов)?\s*в\s*месяц|смен|working\s*hours|work\s*time)/i.test(userText);
-  const askedLoc    = /(локац|город|место|location|where)/i.test(userText);
-  const askedWhatJob= /(что\s+делать|обязан|описани[ея]\s+работ|job\s*description)/i.test(userText);
   if (Object.keys(DF).length) {
-    if (askedSalary) { reply = formatFactsShort(DF,'salary') || reply; parsed.stage ??= 'Demand'; }
-    else if (askedHouse) { reply = formatFactsShort(DF,'accommodation') || reply; parsed.stage ??= 'Demand'; }
-    else if (askedHours) { reply = formatFactsShort(DF,'hours') || reply; parsed.stage ??= 'Demand'; }
-    else if (askedLoc)   { reply = formatFactsShort(DF,'location') || reply; parsed.stage ??= 'Demand'; }
-    else if (askedWhatJob) { reply = formatFactsShort(DF,'all') || reply; parsed.stage ??= 'Demand'; }
+    if (intent === 'ask_price')       { reply = formatFactsShort(DF,'salary') || reply; parsed.stage ??= 'Demand'; }
+    else if (intent === 'ask_accommodation') { reply = formatFactsShort(DF,'accommodation') || reply; parsed.stage ??= 'Demand'; }
+    else if (intent === 'ask_hours')  { reply = formatFactsShort(DF,'hours') || reply; parsed.stage ??= 'Demand'; }
+    else if (intent === 'ask_location'){ reply = formatFactsShort(DF,'location') || reply; parsed.stage ??= 'Demand'; }
+    else if (intent === 'ask_job')    { reply = formatFactsShort(DF,'all') || reply; parsed.stage ??= 'Demand'; }
   }
 
-  // Реактивная просьба документов — только если менеджер спросил «что нужно»
-  if (/(что\s+нужно|what.*need|какие\s+документ\w*\s+нужн)/i.test(userText)) {
+  // Реактивная просьба документов — если спросили «что нужно»
+  if (intent === 'ask_docs') {
     const hasDemandEv = hasEvidence(sid,'demand_letter');
     const hasCoopEv   = hasEvidence(sid,'coop_contract_pdf');
     if (!hasDemandEv || !hasCoopEv) {
@@ -583,14 +594,13 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
       if (!hasDemandEv) setActions.add('ask_demands');
       if (!hasCoopEv)   setActions.add('ask_coop_contract');
     } else {
-      // уже всё есть — не просим повторно
       reply = 'Документы есть. Давайте обсудим кандидатов.';
       parsed.stage = 'Candidate';
       parsed.needEvidence = false;
     }
   }
 
-  // Тихо фиксируем материалы (без «спасибо, получил»)
+  // Тихо фиксируем материалы
   if (inc.has('business_card') || (evidenceDetails && evidenceDetails.business_card)) {
     bumpEvidence(sid, 'business_card', evidenceDetails?.business_card);
   }
@@ -605,19 +615,18 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     if (inc.has(key)) bumpEvidence(sid, key, evidenceDetails?.[key]);
   }
 
-  // После учёта вложений — вычисляем стадию от реальных доказательств
+  // Стадия от доказательств
   const stageByProofs = stageFromProofs(sid);
-  // Если модель поставила более «раннюю» стадию, поднимем до stageByProofs
   const order = new Map([['Greeting',0],['Demand',1],['Contract',2],['Candidate',3],['Payment',4],['Closing',5]]);
   if (!parsed.stage || (order.get(stageByProofs) > order.get(parsed.stage))) {
     parsed.stage = stageByProofs;
   }
 
-  // Никогда не предлагать заново то, что уже есть
+  // Не просим повторно то, что уже есть
   if (hasEvidence(sid,'demand_letter')) setActions.delete('ask_demands');
   if (hasEvidence(sid,'coop_contract_pdf')) setActions.delete('ask_coop_contract');
 
-  // Оплата — только реактивно и без призывов
+  // Оплата — только реактивно
   if (/(банк|банковск|crypto|крипто|usdt|btc|eth|криптовалют)/i.test(userText) && /оплат|плат[её]ж|инвойс|сч[её]т/i.test(userText)) {
     reply = 'Предпочитаю оплату после визы или как минимум после подтверждения регистрации. Крипту не люблю, счёт — банковский.';
     parsed.stage = 'Payment';
@@ -643,10 +652,8 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     }
   }
 
-  // Если модель случайно вставила цены — вырезаем
-  reply = reply.replace(/(?:€|\$\s?|\b(czk|eur|usd)\b)[\s:]*[\d\s.,]+/gi, '').trim();
-
   // Санитария
+  reply = reply.replace(/(?:€|\$\s?|\b(czk|eur|usd)\b)[\s:]*[\d\s.,]+/gi, '').trim();
   reply = redirectEmployerContractToCoop(reply);
   reply = stripEmployerRequisitesRequests(reply);
   reply = stripRequisitesFromDemand(reply);
@@ -657,20 +664,38 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   reply = forceMasculine(reply);
   reply = limitSentences(reply, MAX_SENTENCES);
 
-  // Анти-луп и анти-повторы
-  if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) reply = 'Ок.';
-  reply = repetitionGuard(reply, sid);
+  // Анти-луп/повторы → теперь с осмысленным фолбэком
+  if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) reply = '';
+  reply = repetitionGuard(reply || '', sid, parsed.stage);
   S.lastReply = reply;
 
-  // Ворота: даже при высоком доверии НЕ инициируем «инвойс/счёт»
+  // Умный фолбэк, если всё ещё пусто/«Ок.» и есть понятный интент
+  if ((!reply || /^ок\.?$/i.test(reply)) && intent) {
+    const byIntent = {
+      ask_registration:  () => registrationAnswer(),
+      ask_slots:         () => registrationAnswer(),
+      ask_docs:          () => hasEvidence(sid,'demand_letter') && hasEvidence(sid,'coop_contract_pdf')
+                                ? 'Документы уже есть. Давайте к кандидатам.'
+                                : 'Нужно: Demand + наш B2B-контракт.',
+      ask_price:         () => 'По стоимости услуг обсудим позже — сейчас важнее проверяемость и документы.',
+      ask_candidates:    () => 'Начнём тестово с 1–2 кандидатов. Так надёжнее.',
+      ask_location:      () => formatFactsShort(getDemandFacts(sid),'location') || 'Локацию уточним по деманду.',
+      ask_accommodation: () => formatFactsShort(getDemandFacts(sid),'accommodation') || 'По жилью уточним по деманду.',
+      ask_hours:         () => formatFactsShort(getDemandFacts(sid),'hours') || 'График уточним по деманду.',
+      ask_job:           () => formatFactsShort(getDemandFacts(sid),'all') || 'Опишите обязанности в деманде.'
+    };
+    const f = byIntent[intent];
+    if (f) reply = f();
+  }
+
+  // Ворота: даже при высоком доверии Али не инициирует оплату сам
   const gatesOk = (trust >= 90 && evidenceCountUnique(sid) >= 2 && hasEvidence(sid,'coop_contract_pdf'));
-  if (gatesOk) {
-    // переводим стадию вперёд, но без инициативы по оплате
-    if (order.get(parsed.stage) < order.get('Payment')) parsed.stage = 'Payment';
+  if (gatesOk && order.get(parsed.stage) < order.get('Payment')) {
+    parsed.stage = 'Payment';
     parsed.needEvidence = false;
   }
 
-  parsed.reply = reply.trim();
+  parsed.reply = reply.trim() || 'Слушаю.';
   parsed.suggestedActions = normalizeActions(Array.from(setActions));
 
   if (/(demand|контракт|документ|полный контракт|сотрудничеств)/i.test(parsed.reply) && (!parsed.stage || parsed.stage === 'Greeting')) {
