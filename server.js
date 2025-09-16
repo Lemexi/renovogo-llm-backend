@@ -12,6 +12,31 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
+// ---------- PRICEBOOK ----------
+const PRICEBOOK = `
+[PRICEBOOK v1 — CZ/PL]
+
+— Czech Republic (per candidate):
+  • 3 months — €270 (initial) + €150 (final after PDF)
+  • 6 months — €300 (initial) + €150 (final after PDF)
+  • 9 months — €350 (initial) + €150 (final after PDF)
+  • 24 months (recommended for TRC) — €350 (initial) + €350 (final after PDF)
+  • Embassy registration (long-term only) — €500 = €250 upfront + €250 after confirmation.
+    If no appointment is secured within 6 months — refund €250 advance.
+    Not applicable for seasonal contracts.
+
+— Poland (per candidate):
+  • 9 months seasonal only — €350 (initial) + €150 (final after PDF)
+  • 12 months (1-year contract) — €350 (initial) + €350 (final after PDF)
+  • Embassy registration — same logic as CZ long-term (if applicable).
+
+— General:
+  • Free: verification of any contract received from other sources (send to help@renovogo.com)
+  • Instructions: every PDF includes guidelines to verify authenticity.
+  • All services strictly under Czech & EU law.
+  • Negotiation policy: client may bargain (e.g., “куплю за €300 после получения контракта”);
+    final decision depends on provided proofs and trust ≥ 90 with ≥ 2 hard proofs.
+`;
 // ---------- CORS ----------
 const allowed = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
