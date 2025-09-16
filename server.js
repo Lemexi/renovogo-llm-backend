@@ -36,7 +36,7 @@ const ChatSchema = z.object({
   sessionId: z.string().min(1),
   message: z.string().min(1),
   stage: z.enum(["Greeting","Demand","Candidate","Contract","Payment","Closing"]).optional(),
-  evidences: z.array(z.string()).optional(), // ["business_card","contract",...]
+  evidences: z.array(z.string()).optional(),
   history: z.array(z.object({
     role: z.enum(["user","assistant"]),
     content: z.string(),
@@ -50,10 +50,10 @@ function buildMessages({ history = [], message, trust, evidences }) {
     role: 'system',
     content:
       SYSTEM_PROMPT +
-      `\nТекущий trust=${trust}. Доказательства=${JSON.stringify(evidences || [])}.`
+      `\n\n[Контекст-сервера]\nТекущий trust=${trust}. Доказательства=${JSON.stringify(evidences || [])}.\nПомни: отвечай СТРОГИМ JSON (см. формат в промпте).`
   };
 
-  const trimmed = history.slice(-10).map(h => ({
+  const trimmed = history.slice(-12).map(h => ({
     role: h.role,
     content: h.content
   }));
@@ -61,19 +61,20 @@ function buildMessages({ history = [], message, trust, evidences }) {
   return [sys, ...trimmed, { role: 'user', content: message }];
 }
 
-async function runLLM({ history, message, evidences }) {
+async function runLLM({ history, message, evidences, stage }) {
   const trust = computeTrust({
-    baseTrust: 30,
+    baseTrust: 20,
     evidences: evidences || [],
-    history: (history || []).filter(h => h.stage).map(h => ({ stage: h.stage }))
+    history: (history || []).filter(h => h.stage).map(h => ({ stage: h.stage })),
+    lastUserText: message || ''
   });
 
   const messages = buildMessages({ history, message, trust, evidences });
 
   const resp = await groq.chat.completions.create({
     model: MODEL,
-    temperature: 0.5,
-    response_format: { type: 'json_object' }, // строгий JSON
+    temperature: 0.4,
+    response_format: { type: 'json_object' }, // ждём строгий JSON
     messages
   });
 
@@ -83,33 +84,47 @@ async function runLLM({ history, message, evidences }) {
     parsed = JSON.parse(raw);
   } catch {
     parsed = {
-      reply: "Не понял. Давайте вернёмся к разговору.",
-      confidence: 40,
-      stage: "Greeting",
+      reply: "Не понял. Давайте вернёмся к разговору и начнём с документов (Demand/контракт/uradprace).",
+      confidence: Math.min(40, trust),
+      stage: stage || "Greeting",
       needEvidence: true,
-      suggestedActions: []
+      suggestedActions: ["ask_demands","ask_contract","ask_uradprace"]
     };
   }
 
-  // Принудительная логика финализации
-  const evidenceCount = new Set(evidences || []).size;
-  if (trust >= 90 && evidenceCount >= 2) {
-    if (!Array.isArray(parsed.suggestedActions) || !parsed.suggestedActions.includes('invoice_request')) {
-      parsed.suggestedActions = [...(parsed.suggestedActions || []), 'invoice_request'];
-      parsed.reply = parsed.reply || "Финализируем: пришлите реквизиты/кошелёк.";
-      parsed.stage = 'Payment';
-    }
+  // Принудительная логика финализации (ворота + кол-во пруфов)
+  const uniqEvidenceCount = new Set(evidences || []).size;
+  if (trust >= 90 && uniqEvidenceCount >= 2) {
+    const actions = new Set(parsed.suggestedActions || []);
+    actions.add('invoice_request');
+    parsed.suggestedActions = Array.from(actions);
+    parsed.reply = parsed.reply || "Финализируем: пришлите реквизиты/счёт. После проверки оплатим.";
+    parsed.stage = 'Payment';
+    parsed.needEvidence = false;
+    parsed.confidence = Math.max(parsed.confidence || 0, trust);
   } else {
     if (parsed.stage === 'Payment') {
       parsed.stage = 'Contract';
-      parsed.reply = "Пока рано к оплате. Покажите ещё документы (контракт/пример визы/деманд).";
+      parsed.reply = "Пока рано к оплате. Покажите ещё документы: Demand, контракт и проверку работодателя (uradprace).";
+      const actions = new Set(parsed.suggestedActions || []);
+      actions.add('ask_demands'); actions.add('ask_contract'); actions.add('ask_uradprace');
+      parsed.suggestedActions = Array.from(actions);
+      parsed.needEvidence = true;
+      parsed.confidence = Math.min(parsed.confidence || trust, 80);
     }
   }
 
-  return { trust, evidenceCount, result: parsed };
+  // Страховка: поля по умолчанию
+  parsed.reply ||= "Слушаю. Какие у вас документы для проверки (Demand/контракт/uradprace)?";
+  parsed.stage ||= "Greeting";
+  parsed.confidence = Math.max(0, Math.min(100, Number(parsed.confidence || trust)));
+  parsed.needEvidence = Boolean(parsed.needEvidence);
+  parsed.suggestedActions = Array.isArray(parsed.suggestedActions) ? parsed.suggestedActions : [];
+
+  return { trust, evidenceCount: uniqEvidenceCount, result: parsed };
 }
 
-// ---------- Заглушки для корня и иконок (чтобы не было 404 в логах) ----------
+// ---------- Заглушки для корня и иконок ----------
 app.get('/', (_, res) => {
   res.type('html').send(`<!doctype html>
 <meta charset="utf-8">
@@ -120,7 +135,6 @@ app.get('/', (_, res) => {
 });
 
 app.get('/favicon.ico', (req, res) => {
-  // пустой 1×1 ICO
   const emptyIco = Buffer.from(
     'AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' +
     'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'base64'
@@ -131,7 +145,6 @@ app.get('/favicon.ico', (req, res) => {
 });
 
 app.get(['/apple-touch-icon.png','/apple-touch-icon-precomposed.png'], (req, res) => {
-  // прозрачный 1×1 PNG
   const emptyPng = Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAoMBg7rj2/8AAAAASUVORK5CYII=',
     'base64'
@@ -141,63 +154,45 @@ app.get(['/apple-touch-icon.png','/apple-touch-icon-precomposed.png'], (req, res
   res.send(emptyPng);
 });
 
-// ---------- Твои исходные роуты ----------
-app.post('/chat', async (req, res) => {
-  try {
-    const data = ChatSchema.parse(req.body);
-    const { trust, evidenceCount, result } = await runLLM({
-      history: data.history,
-      message: data.message,
-      evidences: data.evidences
-    });
-    res.json({ ok: true, trust, evidenceCount, result });
-  } catch (e) {
-    console.error(e);
-    res.status(400).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-app.get('/health', (_, res) => res.json({ ok: true }));
-
-// ---------- Совместимость с фронтом: /api/* ----------
+// ---------- Совместимость с фронтом ----------
 app.get('/api/ping', (_, res) => res.json({ ok: true }));
 
-// /api/reply ожидает {agent_key, user_text, evidence, evidences?, history[]}
+// /api/reply ожидает {sessionId?, agent_key?, user_text, evidence?, evidences?, history[]}
 app.post('/api/reply', async (req, res) => {
   try {
     const b = req.body || {};
 
-    // Нормализация под ChatSchema
+    // Нормализация evidences
     const evidences =
-      Array.isArray(b.evidences) ? b.evidences :
+      Array.isArray(b.evidences) ? b.evidences.map(String) :
       (Number.isFinite(b.evidence) ? Array.from({ length: Math.max(0, b.evidence|0) }, (_, i) => `proof_${i+1}`) :
       []);
 
+    // История в формат ChatSchema
     const history = Array.isArray(b.history) ? b.history.map(h => ({
       role: (h.role === 'assistant' ? 'assistant' : 'user'),
-      content: String(h.content || '')
+      content: String(h.content || ''),
+      stage: h.stage ? String(h.stage) : undefined
     })) : [];
 
     const dataForLLM = {
-      sessionId: b.sessionId || 'default',
+      sessionId: String(b.sessionId || 'default'),
       message: String(b.user_text || ''),
       evidences,
       history
     };
 
-    // допускаем отсутствие stage
     const parsed = ChatSchema.partial({ stage: true }).parse(dataForLLM);
-
     const { trust, evidenceCount, result } = await runLLM({
       history: parsed.history,
       message: parsed.message,
-      evidences: parsed.evidences
+      evidences: parsed.evidences,
+      stage: parsed.stage
     });
 
-    // Ответ для фронта
     res.json({
-      text: result.reply || 'Слушаю вас.',
-      agent: { name: 'Али', avatar: 'https://renovogo.com/welcome/assets/ali.png' },
+      text: result.reply,
+      agent: { name: 'Али', avatar: 'https://renovogo.com/welcome/training/ali.png' },
       evidence_delta: 0,
       meta: { ok: true, trust, evidenceCount, stage: result.stage, actions: result.suggestedActions }
     });
@@ -207,33 +202,34 @@ app.post('/api/reply', async (req, res) => {
   }
 });
 
-// /api/score — простой скоринг
+// /api/score — простой скоринг для подсказок менеджеру
 app.post('/api/score', (req, res) => {
   try {
     const b = req.body || {};
     const evidences =
-      Array.isArray(b.evidences) ? b.evidences :
+      Array.isArray(b.evidences) ? b.evidences.map(String) :
       (Number.isFinite(b.evidence) ? Array.from({ length: Math.max(0, b.evidence|0) }, (_, i) => `proof_${i+1}`) :
       []);
     const history = Array.isArray(b.history) ? b.history : [];
+    const lastUserText = history.filter(h => h.role === 'user').slice(-1)[0]?.content || '';
 
-    const trust = computeTrust({ baseTrust: 30, evidences, history: [] });
+    const trust = computeTrust({ baseTrust: 20, evidences, history: [], lastUserText });
     const msgText = history.filter(h => h.role === 'user').map(h => h.content || '').join('\n');
 
     const good = [];
     const bad  = [];
 
     if (/(здрав|прив|добрый)/i.test(msgText)) good.push('Вежливое приветствие'); else bad.push('Нет приветствия');
-    if (/renovogo|renovogo\.com/i.test(msgText)) good.push('Дали проверяемый факт (бренд/сайт)'); else bad.push('Нет проверяемых фактов');
-    if (evidences.length >= 2) good.push('Приложили 2+ доказательства'); else bad.push('Мало доказательств (визитка/документы)');
-    if (/(контракт|сч[её]т|инвойс|готовы начать)/i.test(msgText)) good.push('Есть финальный CTA'); else bad.push('Нет финального CTA');
+    if (/renovogo|renovogo\.com/i.test(msgText)) good.push('Дали проверяемый факт (бренд/сайт)');
+    if (evidences.length >= 2) good.push('Приложили ≥2 доказательства'); else bad.push('Мало доказательств (визитка/документы)');
+    if (/(контракт|сч[её]т|инвойс|готовы начать)/i.test(msgText)) good.push('Есть финальный CTA');
 
     const final = Math.max(0, Math.min(100,
       Math.round(
-        (/(здрав|прив|добрый)/i.test(msgText) ? 20 : 0) +
-        (/renovogo|renovogo\.com/i.test(msgText) ? 20 : 0) +
-        ((evidences.length >= 2) ? 30 : 0) +
-        (/(контракт|сч[её]т|инвойс|готовы начать)/i.test(msgText) ? 30 : 0)
+        (/(здрав|прив|добрый)/i.test(msgText) ? 15 : 0) +
+        (/renovogo|renovogo\.com/i.test(msgText) ? 15 : 0) +
+        ((evidences.length >= 2) ? 35 : 0) +
+        (/(контракт|сч[её]т|инвойс|готовы начать)/i.test(msgText) ? 35 : 0)
       )
     ));
 
@@ -243,6 +239,25 @@ app.post('/api/score', (req, res) => {
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
+
+// Служебные эндпоинты под старые маршруты
+app.post('/chat', async (req, res) => {
+  try {
+    const data = ChatSchema.parse(req.body);
+    const { trust, evidenceCount, result } = await runLLM({
+      history: data.history,
+      message: data.message,
+      evidences: data.evidences,
+      stage: data.stage
+    });
+    res.json({ ok: true, trust, evidenceCount, result });
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+app.get('/health', (_, res) => res.json({ ok: true }));
 
 // ---------- Start ----------
 const PORT = process.env.PORT || 3000;
