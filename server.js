@@ -1,5 +1,5 @@
-// server.js — RenovoGo LLM backend (stable memory, no duplicate asks, clear candidate logic)
-// v2025-09-16-2
+// server.js — RenovoGo LLM backend (stable memory, no dup ACKs, realistic flow)
+// v2025-09-16-3
 
 import 'dotenv/config';
 import express from 'express';
@@ -94,13 +94,39 @@ const extractFirstJsonObject = (s) => {
 };
 const sentSplit = (text) => String(text||'').split(/(?<=[.!?])\s+/).filter(Boolean);
 const limitSentences = (text, max=4) => sentSplit(text).slice(0, max).join(' ').trim();
-function logError(err, ctx=''){ console.error(`[${new Date().toISOString()}] ${ctx}:`, err?.stack || err); }
+
+function logError(err, ctx=''){
+  console.error(`[${new Date().toISOString()}] ${ctx}:`, err?.stack || err);
+}
+
 function forceMasculine(text){
   return String(text||'')
     .replace(/\bрада\b/gi, 'рад')
     .replace(/\bготова\b/gi, 'готов')
     .replace(/\bсмогла\b/gi, 'смог')
     .replace(/\bмогла\b/gi, 'мог');
+}
+function splitSentences(t=''){
+  return String(t).split(/(?<=[.!?])\s+/).filter(s => s.trim());
+}
+function dedupeSentences(t=''){
+  const seen = new Set();
+  const out = [];
+  for (const s of splitSentences(t)) {
+    const key = s.trim().toLowerCase();
+    if (!seen.has(key)) { seen.add(key); out.push(s.trim()); }
+  }
+  return out.join(' ');
+}
+function stripRequisitesFromDemand(t=''){
+  // вычищаем любые предложения вида «реквизит… из Demand»
+  return String(t)
+    .replace(/[^.?!]*реквизит[^.?!]*(из\s+)?demand[^.?!]*[.?!]/gi, '')
+    .replace(/\s{2,}/g,' ')
+    .trim();
+}
+function cleanSales(t=''){
+  return String(t).replace(/(?:оставьте заявку.*?|мы предлагаем широкий спектр услуг)/gi, '').trim();
 }
 
 // ---------- Stage actions ----------
@@ -131,7 +157,7 @@ const normalizeActions = (arr) =>
 const REG_LONGTERM_MONTHS = 6;
 const REG_SEASONAL_MONTHS = 3;
 function registrationAnswer(){
-  return `По долгосрочному — ${REG_LONGTERM_MONTHS} мес назад; по сезонному — ${REG_SEASONAL_MONTHS} мес назад. Очереди нестабильные, поэтому сначала проверю ваш Demand Letter и контракт.`;
+  return `По долгосрочному — ${REG_LONGTERM_MONTHS} мес назад; по сезонному — ${REG_SEASONAL_MONTHS} мес назад. Очереди нестабильные, сначала проверю ваш Demand Letter и контракт.`;
 }
 
 // ---------- Микро-состояние сессии ----------
@@ -175,7 +201,7 @@ async function createChatWithRetry(payload, tries = 2) {
   throw lastErr;
 }
 
-// ---------- Пост-правила (учёт памяти, кандидаты, финализация) ----------
+// ---------- Пост-правила ----------
 function postRules({ parsed, trust, evidences, history, userText, sid }) {
   const S = getState(sid);
 
@@ -228,12 +254,12 @@ function postRules({ parsed, trust, evidences, history, userText, sid }) {
     parsed.suggestedActions = ['ask_demands','ask_coop_contract','ask_price_breakdown'];
   }
 
-  // Признание новых доказательств (ACK) + корректные запросы
+  // Признание новых доказательств (ACK) + корректные запросы (без «реквизитов из Demand»)
   const acks = [];
   if (isNew('demand_letter')) {
-    acks.push('Спасибо за Demand Letter.');
+    acks.push('Demand Letter получил.');
     if (!ev.has('coop_contract_pdf')) {
-      acks.push('Теперь пришлите полноценный контракт о сотрудничестве (полная версия, с печатью/подписью).');
+      acks.push('Пришлите полный контракт о сотрудничестве (PDF с подписью/печатью).');
       parsed.stage = 'Contract';
       parsed.needEvidence = true;
       parsed.suggestedActions = ['ask_coop_contract'];
@@ -261,19 +287,8 @@ function postRules({ parsed, trust, evidences, history, userText, sid }) {
     reply = (reply ? (limitSentences(reply, MAX_SENTENCES) + ' ') : '') + acks.join(' ');
   }
 
-  // Правка лишних «реквизитов работодателя» при наличии Demand
-  if (ev.has('demand_letter') && /реквизит/i.test(reply)) {
-    reply = reply.replace(/[^.?!]*реквизит[^.?!]*работодател[^.?!]*[.?!]/gi, '').trim();
-    if (!ev.has('coop_contract_pdf')) {
-      reply += (reply ? ' ' : '') + 'Реквизиты у меня уже есть из Demand. Нужен полный контракт о сотрудничестве.';
-      parsed.stage = 'Contract';
-      parsed.needEvidence = true;
-      parsed.suggestedActions = ['ask_coop_contract'];
-    }
-  }
-
   // Вопрос про способ оплаты — жёстко «банк»
-  if (/(банк|банковск|crypto|крипто|usdt|криптовалют)/i.test(userText) && /оплат|плат[её]ж|инвойс/i.test(userText)) {
+  if (/(банк|банковск|crypto|крипто|usdt|btc|eth|криптовалют)/i.test(userText) && /оплат|плат[её]ж|инвойс|сч[её]т/i.test(userText)) {
     reply = 'Банковский инвойс. Криптовалюту не принимаем.';
     const set = new Set(parsed.suggestedActions || []);
     set.add('invoice_request');
@@ -282,11 +297,12 @@ function postRules({ parsed, trust, evidences, history, userText, sid }) {
     parsed.needEvidence = false;
   }
 
-  // Убираем клише и правим род
-  reply = forceMasculine(limitSentences(
-    reply.replace(/(?:оставьте заявку.*?|мы предлагаем широкий спектр услуг)/gi, '').trim(),
-    MAX_SENTENCES
-  ));
+  // Убираем продажные клише/реквизиты из Demand/дубли и правим род
+  reply = stripRequisitesFromDemand(reply);
+  reply = dedupeSentences(reply);
+  reply = cleanSales(reply);
+  reply = limitSentences(reply, MAX_SENTENCES);
+  reply = forceMasculine(reply);
 
   // Анти-луп
   if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) {
@@ -439,7 +455,7 @@ function normalizeEvidenceKey(k){
     // Contracts
     ['sample','sample_contract_pdf'], ['sample_contract','sample_contract_pdf'],
     ['contract_sample','sample_contract_pdf'], ['пример_контракта','sample_contract_pdf'],
-    ['contract_pdf','coop_contract_pdf'], // важно для вашего фронта
+    ['contract_pdf','coop_contract_pdf'], // алиас со старого фронта
     ['contract','coop_contract_pdf'], ['contractpdf','coop_contract_pdf'], ['договор','coop_contract_pdf'],
     ['coop_contract','coop_contract_pdf'], ['full_contract','coop_contract_pdf'],
     ['контракт_о_сотрудничестве','coop_contract_pdf'],
@@ -449,7 +465,9 @@ function normalizeEvidenceKey(k){
     ['site','website'], ['сайт','website'], ['website','website'],
     ['reviews','reviews'], ['отзывы','reviews'],
     ['registry','registry_proof'], ['uradprace','registry_proof'], ['регистрация','registry_proof'],
-    ['presentation','presentation'], ['deck','presentation'], ['video','video'], ['youtube','video']
+    ['presentation','presentation'], ['deck','presentation'], ['video','video'], ['youtube','video'],
+    ['price','price_breakdown'], ['slot_plan','slot_plan'], ['company_registry','company_registry'],
+    ['invoice_template','invoice_template'], ['nda','nda']
   ]);
   return map.get(key) || key;
 }
