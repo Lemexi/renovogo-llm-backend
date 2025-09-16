@@ -137,9 +137,7 @@ function stripSalesy(text=''){
   return t.replace(/\s{2,}/g, ' ');
 }
 
-function splitSentences(t=''){
-  return String(t).split(/(?<=[.!?])\s+/).filter(s => s.trim());
-}
+function splitSentences(t=''){ return String(t).split(/(?<=[.!?])\s+/).filter(s => s.trim()); }
 function joinUniqueSentences(chunks=[]){
   const seen = new Set(); const out = [];
   for (const s of chunks.flatMap(splitSentences)) {
@@ -166,22 +164,11 @@ function stripRoboticAcks(t=''){
   const r2 = new RegExp(`[^.?!]*${KEY}[^.?!]*\\b(получил|получена|получено|принял|received|got)\\b[^.?!]*[.?!]`,'gi');
   return String(t).replace(r1,'').replace(r2,'').replace(/\s{2,}/g,' ').trim();
 }
-function cleanSales(t=''){
-  return String(t).replace(/(?:оставьте заявку.*?|мы предлагаем широкий спектр услуг)/gi, '').trim();
-}
-function conciseJoin(parts){
-  return parts.filter(Boolean).map(s=>String(s).trim()).filter(Boolean).join(' ');
-}
+function cleanSales(t=''){ return String(t).replace(/(?:оставьте заявку.*?|мы предлагаем широкий спектр услуг)/gi, '').trim(); }
+function conciseJoin(parts){ return parts.filter(Boolean).map(s=>String(s).trim()).filter(Boolean).join(' '); }
 
 // — сид-рандом по sessionId
-function seededRand(str=''){
-  let h = 2166136261 >>> 0;
-  for (let i=0;i<str.length;i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
-  return () => {
-    h ^= h << 13; h ^= h >>> 17; h ^= h << 5;
-    return ((h >>> 0) % 1000) / 1000;
-  };
-}
+function seededRand(str=''){ let h = 2166136261>>>0; for (let i=0;i<str.length;i++){ h^=str.charCodeAt(i); h=Math.imul(h,16777619);} return ()=>{h^=h<<13;h^=h>>>17;h^=h<<5;return ((h>>>0)%1000)/1000;}; }
 
 /* ПЕРСИСТЕНТНАЯ (в рамках процесса) ПАМЯТЬ СЕССИЙ */
 const sessionState = new Map();
@@ -194,29 +181,19 @@ const sessionState = new Map();
     lastObjection: string,
     demandFacts: Record<string, any>,
     turn: number,
-    repeatStats: {
-      phraseCounts: Map<string, number>,
-      lastUsedTurn: Map<string, number>,
-      topicCounts: Record<string, number>
-    },
+    repeatStats: { phraseCounts: Map<string, number>, lastUsedTurn: Map<string, number>, topicCounts: Record<string, number> },
     alreadyCommitted: boolean
   }>
 */
 function getState(sid='default'){
   if (!sessionState.has(sid)) {
     sessionState.set(sid, {
-      lastReply: '',
-      lastActions: [],
+      lastReply: '', lastActions: [],
       seenEvidences: new Map(),
       evidenceDetails: Object.create(null),
-      lastObjection: '',
-      demandFacts: Object.create(null),
+      lastObjection: '', demandFacts: Object.create(null),
       turn: 0,
-      repeatStats: {
-        phraseCounts: new Map(),
-        lastUsedTurn: new Map(),
-        topicCounts: Object.create(null)
-      },
+      repeatStats: { phraseCounts: new Map(), lastUsedTurn: new Map(), topicCounts: Object.create(null) },
       alreadyCommitted: false
     });
   }
@@ -227,64 +204,39 @@ function getState(sid='default'){
 function bumpEvidence(sid, key, details){
   const S = getState(sid);
   const rec = S.seenEvidences.get(key) || { count: 0, lastAt: 0 };
-  rec.count += 1;
-  rec.lastAt = Date.now();
+  rec.count += 1; rec.lastAt = Date.now();
   S.seenEvidences.set(key, rec);
-  if (details && typeof details === 'object') {
-    S.evidenceDetails[key] = { ...(S.evidenceDetails[key]||{}), ...details };
-  }
+  if (details && typeof details === 'object') S.evidenceDetails[key] = { ...(S.evidenceDetails[key]||{}), ...details };
   return rec.count;
 }
-function evidenceCountUnique(sid){
-  return getState(sid).seenEvidences.size;
-}
-function hasEvidence(sid, key){
-  return getState(sid).seenEvidences.has(key);
-}
+function evidenceCountUnique(sid){ return getState(sid).seenEvidences.size; }
+function hasEvidence(sid, key){ return getState(sid).seenEvidences.has(key); }
 
 /* DEMAND: хранение и парсинг */
 function getDemandFacts(sid){ return getState(sid).demandFacts || {}; }
-function setDemandFacts(sid, facts={}){
-  const S = getState(sid);
-  S.demandFacts = { ...(S.demandFacts||{}), ...facts };
-  return S.demandFacts;
-}
-const num = s => {
-  const m = String(s||'').replace(/\s+/g,'').replace(',', '.').match(/[\d.]+/);
-  return m ? Number(m[0]) : undefined;
-};
+function setDemandFacts(sid, facts={}){ const S = getState(sid); S.demandFacts = { ...(S.demandFacts||{}), ...facts }; return S.demandFacts; }
+const num = s => { const m = String(s||'').replace(/\s+/g,'').replace(',', '.').match(/[\d.]+/); return m ? Number(m[0]) : undefined; };
 function extractDemandFactsFromDetails(details={}){
-  const out = {};
-  const meta = details?.demand_meta;
-  const text = details?.demand_text || '';
-
+  const out = {}; const meta = details?.demand_meta; const text = details?.demand_text || '';
   if (meta && typeof meta === 'object') {
     if (meta.position) out.position = String(meta.position).trim();
     if (meta.job_description) out.job_description = String(meta.job_description).trim();
-    if (meta.salary_net_czk || meta.salary_net_eur) {
-      out.salary = meta.salary_net_czk ? {value:num(meta.salary_net_czk), currency:'CZK'}
-                                       : {value:num(meta.salary_net_eur), currency:'EUR'};
-    }
-    if (meta.accommodation_eur || meta.accommodation) {
-      const v = meta.accommodation_eur ?? meta.accommodation;
-      out.accommodation = { cost_eur: num(v) };
-    }
+    if (meta.salary_net_czk || meta.salary_net_eur) out.salary = meta.salary_net_czk ? {value:num(meta.salary_net_czk), currency:'CZK'} : {value:num(meta.salary_net_eur), currency:'EUR'};
+    if (meta.accommodation_eur || meta.accommodation) out.accommodation = { cost_eur: num(meta.accommodation_eur ?? meta.accommodation) };
     if (meta.transport_to_work) out.transport = String(meta.transport_to_work).trim();
     if (meta.period) out.period = String(meta.period).trim();
     if (meta.hours_monthly) out.hours_monthly = num(meta.hours_monthly);
     if (meta.schedule) out.schedule = String(meta.schedule).trim();
     if (meta.location) out.location = String(meta.location).trim();
   }
-
   const t = String(text);
   if (!out.position)   { const m = t.match(/Position[:\s-]*([^\n]+)/i); if (m) out.position = m[1].trim(); }
   if (!out.salary)     { const m = t.match(/Salary\s*(?:net)?[:\s-]*([^\n]+)/i); if (m){ const v = m[1]; out.salary = /czk/i.test(v) ? {value:num(v), currency:'CZK'} : {value:num(v), currency:'EUR'}; } }
-  if (!out.accommodation){ const m = t.match(/Accommod(?:ation)?[:\s-]*([^\n]+)/i); if (m){ const v = m[1]; const eur = v.match(/(\d[\d\s.,]*)\s*(?:€|eur)/i); if (eur) out.accommodation = { cost_eur:num(eur[1]) }; } }
+  if (!out.accommodation){ const m = t.match(/Accommod(?:ation)?[:\s-]*([^\n]+)/i); if (m){ const v=m[1]; const eur=v.match(/(\d[\d\s.,]*)\s*(?:€|eur)/i); if (eur) out.accommodation={ cost_eur:num(eur[1]) }; } }
   if (!out.hours_monthly){ const m = t.match(/Working\s*hours\s*monthly[:\s-]*([^\n]+)/i); if (m) out.hours_monthly = num(m[1]); }
   if (!out.schedule)   { const m = t.match(/Workhours[:\s-]*([^\n]+)/i) || t.match(/Workday[:\s-]*([^\n]+)/i); if (m) out.schedule = m[1].trim(); }
   if (!out.period)     { const m = t.match(/Employment\s*Period[:\s-]*([^\n]+)/i); if (m) out.period = m[1].trim(); }
   if (!out.location)   { const m = t.match(/Location\s*of\s*work[:\s-]*([^\n]+)/i) || t.match(/Location[:\s-]*([^\n]+)/i); if (m) out.location = m[1].trim(); }
-
   return out;
 }
 function formatFactsShort(facts={}, topic='all'){
@@ -312,15 +264,12 @@ function formatFactsShort(facts={}, topic='all'){
 
 /* Истории: «100% гарантия» — корректируем субъект на «агент/мошенник» */
 function fixGuaranteeStoryText(t=''){
-  return String(t)
-    .replace(/клиент\s+(обещал|дал|гарантир\w*)/gi, 'агент обещал')
-    .replace(/100%\s*гарант\w+/gi, '«гарантию» (что само по себе подозрительно)');
+  return String(t).replace(/клиент\s+(обещал|дал|гарантир\w*)/gi, 'агент обещал').replace(/100%\s*гарант\w+/gi, '«гарантию» (что само по себе подозрительно)');
 }
 
 /* ── Лёгкий детектор интентов (NLU-lite) ── */
 function detectIntent(userText=''){
   const t = String(userText).toLowerCase();
-
   if (/(когда|последн(ий|ый)|дата).*(регист|слот|посольств|запис)/i.test(t)) return 'ask_registration';
   if (/(слот|очеред|термин|запис)/i.test(t)) return 'ask_slots';
   if (/(что\s+нужно|какие\s+документ\w*\s+нужн|что\s+прислать)/i.test(t)) return 'ask_docs';
@@ -330,8 +279,25 @@ function detectIntent(userText=''){
   if (/(жиль|accommodat|общежит|проживан)/i.test(t)) return 'ask_accommodation';
   if (/(график|час(ов)?\s*в\s*месяц|смен|working\s*hours|work\s*time)/i.test(t)) return 'ask_hours';
   if (/(что\s+делать|обязан|описани[ея]\s+работ|job\s*description)/i.test(t)) return 'ask_job';
-
   return null;
+}
+
+/* ── Раппорт-вопросы при низком доверии ── */
+const RAPPORT_QUESTIONS = [
+  'Какая позиция и локация вас интересуют?',
+  'Сколько кандидатов хотите рассмотреть на старте?',
+  'Вы как агент/работодатель? Как к вам обращаться?',
+  'Есть ли требования к языку и жилью?'
+];
+function nextRapportQuestion(sid){
+  const S = getState(sid); const i = (S.turn || 0) % RAPPORT_QUESTIONS.length;
+  return RAPPORT_QUESTIONS[i];
+}
+
+/* Удаление любых просьб документов из текста (защита от «подсказок») */
+function stripDocAsks(t=''){
+  const r = /[^.?!]*(demand|деманд|b2b[-\s]*контракт|контракт\s*о\s*сотрудничестве|пришлите\s+документ|нужен\s+контракт|нужен\s+demand)[^.?!]*[.?!]/gi;
+  return String(t).replace(r, '').replace(/\s{2,}/g,' ').trim();
 }
 
 /* ──────────────────────────────────────────────────────────────
@@ -499,9 +465,11 @@ function repetitionGuard(reply, sid){
   return out.join(' ');
 }
 
-//* ──────────────────────────────────────────────────────────────
+/* ──────────────────────────────────────────────────────────────
    ЧАСТЬ 5.1. POST-RULES (главная логика «клиента»)
    ────────────────────────────────────────────────────────────── */
+
+const TRUST_DOCS_THRESHOLD = 60; // до этого уровня — никаких просьб документов без прямого вопроса
 
 function chooseObjection({ sid, userText='', trust=0, uniqEvidence=0, hasDemand=false, hasCoop=false, stage='Greeting' }){
   const S = getState(sid);
@@ -576,28 +544,11 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   // DEMAND-факты — если менеджер спросил
   const DF = getDemandFacts(sid);
   if (Object.keys(DF).length) {
-    if (intent === 'ask_price')       { reply = formatFactsShort(DF,'salary') || reply; parsed.stage ??= 'Demand'; }
+    if (intent === 'ask_price')        { reply = formatFactsShort(DF,'salary') || reply; parsed.stage ??= 'Demand'; }
     else if (intent === 'ask_accommodation') { reply = formatFactsShort(DF,'accommodation') || reply; parsed.stage ??= 'Demand'; }
-    else if (intent === 'ask_hours')  { reply = formatFactsShort(DF,'hours') || reply; parsed.stage ??= 'Demand'; }
+    else if (intent === 'ask_hours')   { reply = formatFactsShort(DF,'hours') || reply; parsed.stage ??= 'Demand'; }
     else if (intent === 'ask_location'){ reply = formatFactsShort(DF,'location') || reply; parsed.stage ??= 'Demand'; }
-    else if (intent === 'ask_job')    { reply = formatFactsShort(DF,'all') || reply; parsed.stage ??= 'Demand'; }
-  }
-
-  // Реактивная просьба документов — если спросили «что нужно»
-  if (intent === 'ask_docs') {
-    const hasDemandEv = hasEvidence(sid,'demand_letter');
-    const hasCoopEv   = hasEvidence(sid,'coop_contract_pdf');
-    if (!hasDemandEv || !hasCoopEv) {
-      reply = 'Обычно достаточно описания вакансии (Demand) и нашего B2B-контракта.';
-      parsed.stage = hasDemandEv ? 'Contract' : 'Demand';
-      parsed.needEvidence = true;
-      if (!hasDemandEv) setActions.add('ask_demands');
-      if (!hasCoopEv)   setActions.add('ask_coop_contract');
-    } else {
-      reply = 'Документы есть. Давайте обсудим кандидатов.';
-      parsed.stage = 'Candidate';
-      parsed.needEvidence = false;
-    }
+    else if (intent === 'ask_job')     { reply = formatFactsShort(DF,'all') || reply; parsed.stage ??= 'Demand'; }
   }
 
   // Тихо фиксируем материалы
@@ -615,12 +566,46 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     if (inc.has(key)) bumpEvidence(sid, key, evidenceDetails?.[key]);
   }
 
+  // ── Trust-гард: пока доверие ниже порога и НЕ спросили «что нужно»,
+  //     Али не просит документы и не даёт подсказок.
+  const lowTrust = trust < TRUST_DOCS_THRESHOLD;
+  const askedDocs = intent === 'ask_docs';
+
+  if (lowTrust && !askedDocs) {
+    // вырезаем из ответа любые просьбы документов/подсказки и не добавляем actions
+    reply = stripDocAsks(reply);
+    setActions.delete('ask_demands');
+    setActions.delete('ask_coop_contract');
+
+    // если ответа мало — задаём один раппорт-вопрос
+    if (!reply || reply.length < 8) reply = nextRapportQuestion(sid);
+    parsed.needEvidence = false;
+
+    // Стадию не форсим вперёд — остаёмся в Greeting/Demand по ситуации
+    if (!parsed.stage || parsed.stage === 'Greeting') parsed.stage = 'Greeting';
+  }
+
+  // Если менеджер сам спросил «что нужно»
+  if (askedDocs) {
+    const hasDemandEv = hasEvidence(sid,'demand_letter');
+    const hasCoopEv   = hasEvidence(sid,'coop_contract_pdf');
+    if (!hasDemandEv || !hasCoopEv) {
+      reply = 'Обычно достаточно описания вакансии (Demand) и нашего B2B-контракта.';
+      parsed.stage = hasDemandEv ? 'Contract' : 'Demand';
+      parsed.needEvidence = true;
+      if (!hasDemandEv) setActions.add('ask_demands');
+      if (!hasCoopEv)   setActions.add('ask_coop_contract');
+    } else {
+      reply = 'Документы уже есть. Давайте обсудим кандидатов.';
+      parsed.stage = 'Candidate';
+      parsed.needEvidence = false;
+    }
+  }
+
   // Стадия от доказательств
   const stageByProofs = stageFromProofs(sid);
   const order = new Map([['Greeting',0],['Demand',1],['Contract',2],['Candidate',3],['Payment',4],['Closing',5]]);
-  if (!parsed.stage || (order.get(stageByProofs) > order.get(parsed.stage))) {
-    parsed.stage = stageByProofs;
-  }
+  if (!parsed.stage || (order.get(stageByProofs) > order.get(parsed.stage))) parsed.stage = stageByProofs;
 
   // Не просим повторно то, что уже есть
   if (hasEvidence(sid,'demand_letter')) setActions.delete('ask_demands');
@@ -633,16 +618,12 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     parsed.needEvidence = false;
   }
 
-  // Возражения при низком доверии — только при триггерах
+  // Возражения/триггеры по цене
   const uniqEvidence = evidenceCountUnique(sid);
   const hasDemandEv = hasEvidence(sid,'demand_letter');
   const hasCoopEv   = hasEvidence(sid,'coop_contract_pdf');
   if ((parsed.stage === 'Payment' && trust < 90) || /(цена|дорог|оплат|сч[её]т|инвойс)/i.test(userText)) {
-    const obj = chooseObjection({
-      sid, userText, trust, uniqEvidence,
-      hasDemand: hasDemandEv, hasCoop: hasCoopEv,
-      stage: parsed.stage
-    });
+    const obj = chooseObjection({ sid, userText, trust, uniqEvidence, hasDemand: hasDemandEv, hasCoop: hasCoopEv, stage: parsed.stage });
     if (obj) {
       reply = obj.text;
       parsed.stage = obj.stage;
@@ -664,38 +645,19 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   reply = forceMasculine(reply);
   reply = limitSentences(reply, MAX_SENTENCES);
 
-  // Анти-луп/повторы → теперь с осмысленным фолбэком
+  // Анти-луп/повторы → осмысленный фолбэк
   if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) reply = '';
   reply = repetitionGuard(reply || '', sid, parsed.stage);
   S.lastReply = reply;
 
-  // Умный фолбэк, если всё ещё пусто/«Ок.» и есть понятный интент
-  if ((!reply || /^ок\.?$/i.test(reply)) && intent) {
-    const byIntent = {
-      ask_registration:  () => registrationAnswer(),
-      ask_slots:         () => registrationAnswer(),
-      ask_docs:          () => hasEvidence(sid,'demand_letter') && hasEvidence(sid,'coop_contract_pdf')
-                                ? 'Документы уже есть. Давайте к кандидатам.'
-                                : 'Нужно: Demand + наш B2B-контракт.',
-      ask_price:         () => 'По стоимости услуг обсудим позже — сейчас важнее проверяемость и документы.',
-      ask_candidates:    () => 'Начнём тестово с 1–2 кандидатов. Так надёжнее.',
-      ask_location:      () => formatFactsShort(getDemandFacts(sid),'location') || 'Локацию уточним по деманду.',
-      ask_accommodation: () => formatFactsShort(getDemandFacts(sid),'accommodation') || 'По жилью уточним по деманду.',
-      ask_hours:         () => formatFactsShort(getDemandFacts(sid),'hours') || 'График уточним по деманду.',
-      ask_job:           () => formatFactsShort(getDemandFacts(sid),'all') || 'Опишите обязанности в деманде.'
-    };
-    const f = byIntent[intent];
-    if (f) reply = f();
-  }
+  // Если всё ещё пусто — зададим один раппорт-вопрос
+  if (!reply || /^ок\.?$/i.test(reply)) reply = nextRapportQuestion(sid);
 
   // Ворота: даже при высоком доверии Али не инициирует оплату сам
   const gatesOk = (trust >= 90 && evidenceCountUnique(sid) >= 2 && hasEvidence(sid,'coop_contract_pdf'));
-  if (gatesOk && order.get(parsed.stage) < order.get('Payment')) {
-    parsed.stage = 'Payment';
-    parsed.needEvidence = false;
-  }
+  if (gatesOk && order.get(parsed.stage) < order.get('Payment')) { parsed.stage = 'Payment'; parsed.needEvidence = false; }
 
-  parsed.reply = reply.trim() || 'Слушаю.';
+  parsed.reply = reply.trim();
   parsed.suggestedActions = normalizeActions(Array.from(setActions));
 
   if (/(demand|контракт|документ|полный контракт|сотрудничеств)/i.test(parsed.reply) && (!parsed.stage || parsed.stage === 'Greeting')) {
