@@ -983,6 +983,80 @@ function pluralRu(n, one, few, many){
 }
 
 /* ──────────────────────────────────────────────────────────────
+   ЧАСТЬ 5.4. LLM-ОРКЕСТРАТОР (runLLM)
+   ────────────────────────────────────────────────────────────── */
+
+async function runLLM({ history, message, evidences, stage, sessionId='default', evidenceDetails }) {
+  const trust = computeTrust({
+    baseTrust: 20,
+    evidences: Array.from(new Set(evidences || [])),
+    history: history || [],
+    lastUserText: message || ''
+  });
+
+  // Нормализация входа (редиректор «контракт работодателя» → B2B)
+  const safeMessage = redirectEmployerContractToCoop(message || '');
+
+  const messages = buildMessages({
+    history, message: safeMessage, trust, evidences, evidenceDetails
+  });
+
+  const resp = await createChatWithRetry({
+    model: MODEL,
+    temperature: TEMPERATURE,
+    top_p: 0.9,
+    frequency_penalty: 0.4,
+    presence_penalty: 0.0,
+    max_tokens: REPLY_MAX_TOKENS,
+    response_format: { type: 'json_object' },
+    messages
+  });
+
+  const raw = resp?.choices?.[0]?.message?.content || '{}';
+  const json = extractFirstJsonObject(raw) || { reply: '' };
+
+  let parsed;
+  try {
+    parsed = LLMShape.parse(json);
+  } catch {
+    parsed = null;
+  }
+
+  if (!parsed) {
+    const fb = stage === 'Payment'
+      ? 'Мне важны подтверждения по документам.'
+      : 'Опишите, пожалуйста, предложение или пришлите документы.';
+    parsed = {
+      reply: fb,
+      confidence: Math.max(0, Math.min(60, trust)),
+      stage: stage || 'Greeting',
+      needEvidence: false,
+      suggestedActions: []
+    };
+  }
+
+  // Типобезопасность
+  parsed.reply = String(parsed.reply || '').trim();
+  parsed.stage = String(parsed.stage || stage || 'Greeting');
+  parsed.confidence = Math.max(0, Math.min(100, Number(parsed.confidence ?? trust)));
+  parsed.needEvidence = Boolean(parsed.needEvidence);
+  parsed.suggestedActions = Array.isArray(parsed.suggestedActions) ? parsed.suggestedActions : [];
+
+  // Пост-правила (включая 5.1 + 5.2 + 5.3)
+  parsed = postRules({
+    parsed,
+    trust,
+    evidences,
+    history,
+    userText: safeMessage,
+    sid: sessionId || 'default',
+    evidenceDetails
+  });
+
+  return { trust, evidenceCount: evidenceCountUnique(sessionId), result: parsed };
+}
+
+/* ──────────────────────────────────────────────────────────────
    ЧАСТЬ 6. РОУТЫ: root/assets, API, совместимость
    ────────────────────────────────────────────────────────────── */
 
