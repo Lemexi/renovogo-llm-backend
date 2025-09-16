@@ -301,7 +301,7 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     }
   }
 
-  // ==== Hesitation lines (когда он не готов платить) ====
+  // ==== Hesitation lines (при низком доверии в Payment) ====
   const HESITATION_LINES = [
     'Понимаю, но для меня это пока дорого.',
     'Пожалуйста, не давите. Если решу работать с вами — обязательно сообщу.',
@@ -310,58 +310,35 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     'Для меня это дорого, могу заплатить после визы.',
     'Готов оплатить после разрешений на работу. Сейчас рисковать такой суммой не хочу.',
     'Пока не уверен, что хочу работать именно с вами.',
-    'Я отпрвил Ваш запрос пратнерам, пока нет кандидатов.'
+    'Я отправил ваш запрос партнёрам, пока нет кандидатов.'
   ];
 
-  // Псевдослучайный выбор без повторов подряд + анти-спам
   function pickHesitation(state) {
     if (!state.meta) state.meta = {};
     const last = state.meta.lastHesitationLine;
-    const now  = Date.now();
-    const lastTs       = state.meta.lastHesitationTs || 0;
-    const lastMsgCount = state.meta.lastHesitationMsgCount || 0;
-    const canUseByTime = (now - lastTs) > 120000; // 2 мин
-    const canUseByMsgs = (state.meta.totalUserMsgs || 0) - lastMsgCount >= 4;
-    const canUse = canUseByTime || canUseByMsgs;
-
-    if (!canUse) {
-      return { line: 'Я еще работаю над этим, думаю через неделю вам отпишу', counted: false };
-    }
-
     const pool = last ? HESITATION_LINES.filter(l => l !== last) : [...HESITATION_LINES];
     const line = pool[Math.floor(Math.random() * pool.length)];
-
     state.meta.lastHesitationLine = line;
-    state.meta.lastHesitationTs = now;
-    state.meta.lastHesitationMsgCount = (state.meta.totalUserMsgs || 0);
-
-    return { line, counted: true };
+    return line;
   }
 
-  // === Guard: не инициировать оплату при низком доверии ===
+  // Guard: не инициировать оплату при низком доверии
   {
     const currentTrust = Number.isFinite(trust) ? trust : (S.scores?.trust ?? 50);
     if (parsed.stage === 'Payment' && currentTrust < 90) {
-      const picked = pickHesitation(S);
-      reply = picked.line;
+      reply = pickHesitation(S);
       parsed.stage = 'Contract';
       parsed.needEvidence = true;
       setActions.add('ask_demands');
       setActions.add('ask_coop_contract');
       setActions.add('ask_price_breakdown');
-      if (picked.counted) {
-        S.scores.rapport = Math.max(0, (S.scores.rapport || 0) - 10); // штраф только к раппорту
-      }
     }
   }
 
-  // ====== Тихая фиксация приходящих материалов (без «получил/спасибо») ======
-  // Визитка — тихо сохраняем
+  // ====== Тихая фиксация материалов ======
   if (inc.has('business_card') || (evidenceDetails && evidenceDetails.business_card)) {
     bumpEvidence(sid, 'business_card', evidenceDetails?.business_card);
   }
-
-  // Demand Letter — тихо учитываем. Если ещё нет coop-контракта — мягко направляем на него
   if (inc.has('demand_letter')) {
     bumpEvidence(sid, 'demand_letter');
     if (!hasEvidence(sid,'coop_contract_pdf')) {
@@ -371,8 +348,6 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
       reply = joinUniqueSentences([reply, 'Пожалуйста, отправьте оффер или контракт с условиями сотрудничества.']);
     }
   }
-
-  // Пример контракта — тихо учитываем; просим полный контракт
   if (inc.has('sample_contract_pdf')) {
     bumpEvidence(sid, 'sample_contract_pdf');
     if (!hasEvidence(sid,'coop_contract_pdf')) {
@@ -382,33 +357,30 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
       reply = joinUniqueSentences([reply, 'Могли бы вы отправить контракт B2B?']);
     }
   }
-
-  // Полный контракт — тихо учитываем; направляем к цене/инвойсу
   if (inc.has('coop_contract_pdf')) {
     bumpEvidence(sid, 'coop_contract_pdf');
     parsed.stage = 'Contract';
     parsed.needEvidence = false;
     setActions.add('ask_price_breakdown');
-    reply = joinUniqueSentences([reply, 'Спасибо, ознакомился с условиями контракта. Пока не уверен, стоит работать или нет.']);
+    reply = joinUniqueSentences([reply, 'Спасибо, ознакомился с условиями контракта.']);
   }
-
-  // Прочие материалы — тихо учитываем
   for (const key of ['visa_sample','presentation','video','website','company_registry','reviews','registry_proof','price_breakdown','slot_plan','invoice_template','nda']) {
     if (inc.has(key)) bumpEvidence(sid, key, evidenceDetails?.[key]);
   }
 
-  // ====== Политика оплаты — только банк ======
-  if (/(банк|банковск|crypto|крипто|usdt|btc|eth|криптовалют)/i.test(userText) && /оплат|плат[её]ж|инвойс|сч[её]т/i.test(userText)) {
+  // ====== Оплата — только банк ======
+  if (/(банк|банковск|crypto|крипто|usdt|btc|eth|криптовалют)/i.test(userText) &&
+      /оплат|плат[её]ж|инвойс|сч[её]т/i.test(userText)) {
     reply = 'Банковский инвойс. Криптовалюту не принимаем.';
     setActions.add('invoice_request');
     parsed.stage = 'Payment';
     parsed.needEvidence = false;
   }
 
-  // ====== Санитария текста (убираем лишнее и «робота») ======
-  reply = stripEmployerRequisitesRequests(reply); // не просим «реквизиты работодателя»
-  reply = stripRequisitesFromDemand(reply);       // не просим «реквизиты из Demand»
-  reply = stripRoboticAcks(reply);                // убираем «спасибо/получил X» на каждое сообщение
+  // ====== Санитария текста ======
+  reply = stripEmployerRequisitesRequests(reply);
+  reply = stripRequisitesFromDemand(reply);
+  reply = stripRoboticAcks(reply);
   reply = cleanSales(reply);
   reply = forceMasculine(reply);
   reply = limitSentences(reply, MAX_SENTENCES);
@@ -421,10 +393,10 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   }
   S.lastReply = reply;
 
-  // Финальные ворота — контракт + ≥2 уникальных пруфа + trust≥90
+  // Финальные ворота — контракт + ≥2 пруфа + trust≥90
   const uniqEvidenceCount = evidenceCountUnique(sid);
   const hasCoop = hasEvidence(sid,'coop_contract_pdf');
-  const gatesOk = ( (Number.isFinite(trust) ? trust : S.scores.trust) >= 90 && uniqEvidenceCount >= 2 && hasCoop );
+  const gatesOk = ((Number.isFinite(trust) ? trust : S.scores.trust) >= 90 && uniqEvidenceCount >= 2 && hasCoop);
   if (gatesOk) {
     setActions.add('invoice_request');
     if (!/инвойс|сч[её]т|реквизит/i.test(reply)) {
@@ -435,26 +407,10 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   }
 
   parsed.reply = reply.trim();
-  parsed.suggestedActions = normalizeActions(Array.from(new Set([...(parsed.suggestedActions||[]), ...setActions])));
+  parsed.suggestedActions = normalizeActions([...setActions, ...(parsed.suggestedActions||[])]);
 
   // Если просим документы — stage не ниже Demand
-  if (/(demand|контракт|документ|полный контракт|сотрудничеств)/i.test(parsed.reply) && (!parsed.stage || parsed.stage === 'Greeting')) {
-    parsed.stage = 'Demand';
-  }
-
-  // --- Fallback если после всех правил ответ пустой ---
-  if (!reply || reply.length < 2) {
-    reply = 'Слушаю вас. Расскажите подробнее.';
-    parsed.stage ??= 'Greeting';
-  }
-
-  parsed.reply = reply.trim();
-  parsed.suggestedActions = normalizeActions(
-    Array.from(new Set([...(parsed.suggestedActions||[]), ...setActions]))
-  );
-
-  // Если просим документы — stage не ниже Demand
-  if (/(demand|контракт|документ|полный контракт|сотрудничеств)/i.test(parsed.reply) &&
+  if (/(demand|контракт|документ|сотрудничеств)/i.test(parsed.reply) &&
       (!parsed.stage || parsed.stage === 'Greeting')) {
     parsed.stage = 'Demand';
   }
