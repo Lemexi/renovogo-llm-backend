@@ -647,10 +647,10 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
 
   // Анти-луп/повторы → осмысленный фолбэк
   if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) reply = '';
-  reply = repetitionGuard(reply || '', sid, parsed.stage);
+  reply = repetitionGuard(reply || '', sid);
   S.lastReply = reply;
 
-  // Если всё ещё пусто — зададим один раппорт-вопрос
+  // Если всё ещё пусто или «Ок.» — зададим один раппорт-вопрос
   if (!reply || /^ок\.?$/i.test(reply)) reply = nextRapportQuestion(sid);
 
   // Ворота: даже при высоком доверии Али не инициирует оплату сам
