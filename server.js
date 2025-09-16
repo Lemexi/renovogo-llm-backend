@@ -1,5 +1,9 @@
 // server.js — RenovoGo LLM backend (stable memory, no robotic ACKs, realistic flow)
-// v2025-09-16-8 (human objections on low trust)
+// v2025-09-16-9
+
+/* ──────────────────────────────────────────────────────────────
+   ЧАСТЬ 1. БАЗА: импорты, app, CORS, мини-рейт-лимит
+   ────────────────────────────────────────────────────────────── */
 
 import 'dotenv/config';
 import express from 'express';
@@ -14,7 +18,6 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
-// ---------- CORS ----------
 const allowed = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -27,7 +30,6 @@ app.use(cors({
   credentials: false
 }));
 
-// ---------- Mini Rate Limit ----------
 const rlStore = new Map(); // ip -> { count, reset }
 function miniRateLimit(req, res, next){
   if (!req.path.startsWith('/api/')) return next();
@@ -45,14 +47,16 @@ function miniRateLimit(req, res, next){
 }
 app.use(miniRateLimit);
 
-// ---------- Groq ----------
+/* ──────────────────────────────────────────────────────────────
+   ЧАСТЬ 2. МОДЕЛЬ, ПРАЙС, СХЕМЫ
+   ────────────────────────────────────────────────────────────── */
+
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
 const TEMPERATURE = Number(process.env.TEMPERATURE ?? 0.2);
 const REPLY_MAX_TOKENS = Number(process.env.REPLY_MAX_TOKENS ?? 320);
 const MAX_SENTENCES = Number(process.env.MAX_SENTENCES ?? 4);
 
-// ---------- PRICEBOOK (fees, not salaries) ----------
 const PRICEBOOK = `
 [PRICEBOOK v1 — CZ/PL (fees, not salaries)]
 — Czech Republic (service fees per candidate):
@@ -65,7 +69,6 @@ const PRICEBOOK = `
 — NOTE: Service fees are NOT employee salary. Never mix fees with wages.
 `;
 
-// ---------- Schemas ----------
 const ChatSchema = z.object({
   sessionId: z.string().min(1),
   message: z.string().min(1),
@@ -86,7 +89,10 @@ const LLMShape = z.object({
   suggestedActions: z.array(z.string()).optional()
 });
 
-// ---------- Utils ----------
+/* ──────────────────────────────────────────────────────────────
+   ЧАСТЬ 3. УТИЛИТЫ, МИКРО-ПАМЯТЬ, ПАРСЕР DEMAND
+   ────────────────────────────────────────────────────────────── */
+
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 const extractFirstJsonObject = (s) => {
   const m = String(s||'').match(/\{[\s\S]*\}/);
@@ -100,6 +106,7 @@ function logError(err, ctx=''){
   console.error(`[${new Date().toISOString()}] ${ctx}:`, err?.stack || err);
 }
 
+// — анти-«женский род» (персона Али — мужчина)
 function forceMasculine(text){
   return String(text||'')
     .replace(/\bрада\b/gi, 'рад')
@@ -119,78 +126,17 @@ function joinUniqueSentences(chunks=[]){
   return out.join(' ');
 }
 function stripRequisitesFromDemand(t=''){
-  // убираем любые фразы «реквизиты из Demand»
   return String(t)
     .replace(/[^.?!]*реквизит[^.?!]*(из\s+)?demand[^.?!]*[.?!]/gi, '')
     .replace(/\s{2,}/g,' ')
     .trim();
 }
-// убираем запросы «реквизиты работодателя/employer requisites»
 function stripEmployerRequisitesRequests(t=''){
   return String(t).replace(
     /[^.?!]*(реквизит\w*|requisite\w*)[^.?!]*(работодател\w*|employer)[^.?!]*[.?!]/gi,
     ''
   );
 }
-// === Greeting helpers ===
-function extractUserName({ history = [], evidenceDetails = {} } = {}) {
-  // 1) из визитки
-  const cardName = evidenceDetails?.business_card?.name;
-  if (cardName && String(cardName).trim()) return String(cardName).trim();
-
-  // 2) из последних реплик пользователя: "Я Виктор", "Это Виктор", подпись и т.п.
-  const lastUser = [...(history||[])].reverse().find(h => h.role === 'user');
-  const txt = (lastUser?.content || '').trim();
-  // очень мягкий хак: ищем слово с заглавной буквы рядом с "я"/"меня зовут"/подпись
-  const m = txt.match(/(?:я|меня\s+зовут|это)\s+([A-ZА-ЯЁ][a-zа-яё\-\']{1,30})/i);
-  if (m) return m[1];
-
-  return '';
-}
-
-function rewriteVacancyQuestionToSupplierRole(text=''){
-  // Переводим «какие вакансии вы ищете?» → «какие вакансии у вас доступны?»
-  let t = String(text);
-
-  // Грубая замена частых форм
-  t = t.replace(/какие\s+вакансии[^.?!]*ищете[^.?!]*[.?!]?/gi, 'Какие вакансии у вас доступны?');
-
-  // Убираем лишние самопрезентации вида «Мы работаем с Чехией и Польшей уже давно»
-  t = t.replace(/мы\s+работаем[^.?!]*чех(и|и|ии)й[^.?!]*польш[^.?!]*уже\s+давно[^.?!]*[.?!]?/gi, '');
-
-  // Слегка чистим двойные пробелы/точки
-  t = t.replace(/\s{2,}/g, ' ').replace(/\s+([?.!])/g, '$1').trim();
-
-  return t;
-}
-
-function craftHumanGreeting({ base='', name='' } = {}){
-  // Короткие варианты; без «спасибо за визитку», без «мы давно работаем»
-  const variants = name
-    ? [
-        `Привет, ${name}. Чем могу помочь?`,
-        `${name}, рад знакомству. С какими задачами ко мне пришли?`,
-        `${name}, мне тоже приятно. Какие вакансии у вас сейчас открыты?`
-      ]
-    : [
-        'Привет! Чем могу помочь?',
-        'Рад знакомству. Какие вакансии у вас сейчас открыты?',
-        'Здравствуйте. С чего начнём: какие вакансии у вас доступны?'
-      ];
-
-  // Если LLM уже что-то сказал — аккуратно подменяем только вопросную часть
-  let t = rewriteVacancyQuestionToSupplierRole(base);
-  if (!t || t.length < 3) {
-    t = variants[Math.floor(Math.random()*variants.length)];
-  } else {
-    // если не осталось вопроса — доклеим корректный
-    if (!/[?]$/.test(t) && !/ваканси/i.test(t)) {
-      t = `${t} Какие вакансии у вас доступны?`;
-    }
-  }
-  return forceMasculine(t);
-}
-// убираем «роботские» ACK’и типа «спасибо/получил визитку/деманд/контракт/видео»
 function stripRoboticAcks(t=''){
   const KEY = '(demand|деманд|business\\s*card|визитк|контракт|соглашен|sample|презентац|video|видео|виза|pdf)';
   const r1 = new RegExp(`[^.?!]*\\b(спасибо|получил|получена|получено|принял|received|got)\\b[^.?!]*${KEY}[^.?!]*[.?!]`,'gi');
@@ -204,7 +150,7 @@ function conciseJoin(parts){
   return parts.filter(Boolean).map(s=>String(s).trim()).filter(Boolean).join(' ');
 }
 
-// простой сид-рандом по sessionId
+// — сид-рандом по sessionId
 function seededRand(str=''){
   let h = 2166136261 >>> 0;
   for (let i=0;i<str.length;i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
@@ -214,7 +160,123 @@ function seededRand(str=''){
   };
 }
 
-// ---------- Stage actions ----------
+/* микропамять сессии */
+const sessionState = new Map();
+/*
+  sessionState: Map<sid, {
+    lastReply: string,
+    lastActions: string[],
+    seenEvidences: Map<key, { count: number, lastAt: number }>,
+    evidenceDetails: Record<string, any>,
+    lastObjection: string,
+    demandFacts: Record<string, any>
+  }>
+*/
+function getState(sid='default'){
+  if (!sessionState.has(sid)) {
+    sessionState.set(sid, {
+      lastReply: '',
+      lastActions: [],
+      seenEvidences: new Map(),
+      evidenceDetails: Object.create(null),
+      lastObjection: '',
+      demandFacts: Object.create(null)
+    });
+  }
+  return sessionState.get(sid);
+}
+
+/* учёт «доказательств» */
+function bumpEvidence(sid, key, details){
+  const S = getState(sid);
+  const rec = S.seenEvidences.get(key) || { count: 0, lastAt: 0 };
+  rec.count += 1;
+  rec.lastAt = Date.now();
+  S.seenEvidences.set(key, rec);
+  if (details && typeof details === 'object') {
+    S.evidenceDetails[key] = { ...(S.evidenceDetails[key]||{}), ...details };
+  }
+  return rec.count;
+}
+function evidenceCountUnique(sid){
+  return getState(sid).seenEvidences.size;
+}
+function hasEvidence(sid, key){
+  return getState(sid).seenEvidences.has(key);
+}
+
+/* DEMAND: хранение и парсинг */
+function getDemandFacts(sid){ return getState(sid).demandFacts || {}; }
+function setDemandFacts(sid, facts={}){
+  const S = getState(sid);
+  S.demandFacts = { ...(S.demandFacts||{}), ...facts };
+  return S.demandFacts;
+}
+const num = s => {
+  const m = String(s||'').replace(/\s+/g,'').replace(',', '.').match(/[\d.]+/);
+  return m ? Number(m[0]) : undefined;
+};
+function extractDemandFactsFromDetails(details={}){
+  const out = {};
+  const meta = details?.demand_meta;
+  const text = details?.demand_text || '';
+
+  if (meta && typeof meta === 'object') {
+    if (meta.position) out.position = String(meta.position).trim();
+    if (meta.job_description) out.job_description = String(meta.job_description).trim();
+    if (meta.salary_net_czk || meta.salary_net_eur) {
+      out.salary = meta.salary_net_czk ? {value:num(meta.salary_net_czk), currency:'CZK'}
+                                       : {value:num(meta.salary_net_eur), currency:'EUR'};
+    }
+    if (meta.accommodation_eur || meta.accommodation) {
+      const v = meta.accommodation_eur ?? meta.accommodation;
+      out.accommodation = { cost_eur: num(v) };
+    }
+    if (meta.transport_to_work) out.transport = String(meta.transport_to_work).trim();
+    if (meta.period) out.period = String(meta.period).trim();
+    if (meta.hours_monthly) out.hours_monthly = num(meta.hours_monthly);
+    if (meta.schedule) out.schedule = String(meta.schedule).trim();
+    if (meta.location) out.location = String(meta.location).trim();
+  }
+
+  const t = String(text);
+  if (!out.position)   { const m = t.match(/Position[:\s-]*([^\n]+)/i); if (m) out.position = m[1].trim(); }
+  if (!out.salary)     { const m = t.match(/Salary\s*(?:net)?[:\s-]*([^\n]+)/i); if (m){ const v = m[1]; out.salary = /czk/i.test(v) ? {value:num(v), currency:'CZK'} : {value:num(v), currency:'EUR'}; } }
+  if (!out.accommodation){ const m = t.match(/Accommod(?:ation)?[:\s-]*([^\n]+)/i); if (m){ const v = m[1]; const eur = v.match(/(\d[\d\s.,]*)\s*(?:€|eur)/i); if (eur) out.accommodation = { cost_eur:num(eur[1]) }; } }
+  if (!out.hours_monthly){ const m = t.match(/Working\s*hours\s*monthly[:\s-]*([^\n]+)/i); if (m) out.hours_monthly = num(m[1]); }
+  if (!out.schedule)   { const m = t.match(/Workhours[:\s-]*([^\n]+)/i) || t.match(/Workday[:\s-]*([^\n]+)/i); if (m) out.schedule = m[1].trim(); }
+  if (!out.period)     { const m = t.match(/Employment\s*Period[:\s-]*([^\n]+)/i); if (m) out.period = m[1].trim(); }
+  if (!out.location)   { const m = t.match(/Location\s*of\s*work[:\s-]*([^\n]+)/i) || t.match(/Location[:\s-]*([^\n]+)/i); if (m) out.location = m[1].trim(); }
+
+  return out;
+}
+function formatFactsShort(facts={}, topic='all'){
+  const f = facts || {};
+  const salaryStr = f.salary?.value ? `нетто от ${f.salary.value} ${f.salary.currency}` : null;
+  const accomStr  = (f.accommodation?.cost_eur ? `жильё ~€${f.accommodation.cost_eur}/мес` : null);
+  const hoursStr  = (f.hours_monthly ? `~${f.hours_monthly} ч/мес` : null);
+  const schedStr  = (f.schedule ? `${f.schedule}` : null);
+  const posStr    = (f.position ? `${f.position}` : null);
+  const locStr    = (f.location ? `${f.location}` : null);
+  const periodStr = (f.period ? `${f.period}` : null);
+
+  if (topic === 'salary' && salaryStr) return `По деманду: ${salaryStr}.`;
+  if (topic === 'accommodation' && accomStr) return `По жилью из деманда: ${accomStr}.`;
+  if (topic === 'hours' && (hoursStr || schedStr)) return `График по деманду: ${[hoursStr, schedStr].filter(Boolean).join(', ')}.`;
+  if (topic === 'location' && locStr) return `Локация в деманде: ${locStr}.`;
+
+  const line1 = [posStr, locStr, periodStr].filter(Boolean).join(' • ');
+  const line2 = [salaryStr, accomStr, hoursStr || schedStr].filter(Boolean).join(' • ');
+  if (line1 && line2) return `По деманду вижу: ${line1}. Условия: ${line2}.`;
+  if (line1) return `По деманду вижу: ${line1}.`;
+  if (line2) return `Условия по деманду: ${line2}.`;
+  return '';
+}
+
+/* ──────────────────────────────────────────────────────────────
+   ЧАСТЬ 4. СТАДИИ, КОНСТАНТЫ, ПРИВЕТСТВИЕ
+   ────────────────────────────────────────────────────────────── */
+
 const ACTION_WHITELIST = [
   "ask_demands",
   "ask_sample_contract",
@@ -238,56 +300,54 @@ const normalizeActions = (arr) =>
     .filter(a => ACTION_WHITELIST.includes(a))))
     .sort((a,b)=> (ACTION_ORDER.get(a)||99)-(ACTION_ORDER.get(b)||99));
 
-// ---------- Консистентные ответы по слотам ----------
 const REG_LONGTERM_MONTHS = 6;
 const REG_SEASONAL_MONTHS = 3;
 function registrationAnswer(){
-  return `По долгосрочному — ${REG_LONGTERM_MONTHS} мес назад; по сезонному — ${REG_SEASONAL_MONTHS} мес назад. Очереди нестабильные.`;
+  return `По долгосрочному — ${REG_LONGTERM_MONTHS} мес назад; по сезонному — ${REG_SEASONAL_MONTHS} мес назад. Очереди нестабильные. Сначала проверю Demand Letter и контракт.`;
 }
 
-// ---------- Микро-состояние сессии ----------
-/*
-  sessionState: Map<sid, {
-    lastReply: string,
-    lastActions: string[],
-    seenEvidences: Map<key, { count: number, lastAt: number }>,
-    evidenceDetails: Record<string, any>,
-    lastObjection: string
-  }>
-*/
-const sessionState = new Map();
-function getState(sid='default'){
-  if (!sessionState.has(sid)) {
-    sessionState.set(sid, {
-      lastReply: '',
-      lastActions: [],
-      seenEvidences: new Map(),
-      evidenceDetails: Object.create(null),
-      lastObjection: ''
-    });
+// greeting helpers
+function extractUserName({ history = [], evidenceDetails = {} } = {}) {
+  const cardName = evidenceDetails?.business_card?.name;
+  if (cardName && String(cardName).trim()) return String(cardName).trim();
+  const lastUser = [...(history||[])].reverse().find(h => h.role === 'user');
+  const txt = (lastUser?.content || '').trim();
+  const m = txt.match(/(?:я|меня\s+зовут|это)\s+([A-ZА-ЯЁ][a-zа-яё\-\']{1,30})/i);
+  if (m) return m[1];
+  return '';
+}
+function rewriteVacancyQuestionToSupplierRole(text=''){
+  let t = String(text);
+  t = t.replace(/какие\s+вакансии[^.?!]*ищете[^.?!]*[.?!]?/gi, 'Какие вакансии у вас доступны?');
+  t = t.replace(/мы\s+работаем[^.?!]*чех[иия][^.?!]*польш[^.?!]*уже\s+давно[^.?!]*[.?!]?/gi, '');
+  t = t.replace(/\s{2,}/g, ' ').replace(/\s+([?.!])/g, '$1').trim();
+  return t;
+}
+function craftHumanGreeting({ base='', name='' } = {}){
+  const variants = name
+    ? [
+        `Привет, ${name}. Чем могу помочь?`,
+        `${name}, рад знакомству. С какими задачами ко мне пришли?`,
+        `${name}, мне тоже приятно. Какие вакансии у вас сейчас открыты?`
+      ]
+    : [
+        'Привет! Чем могу помочь?',
+        'Рад знакомству. Какие вакансии у вас сейчас открыты?',
+        'Здравствуйте. С чего начнём: какие вакансии у вас доступны?'
+      ];
+  let t = rewriteVacancyQuestionToSupplierRole(base);
+  if (!t || t.length < 3) {
+    t = variants[Math.floor(Math.random()*variants.length)];
+  } else if (!/[?]$/.test(t) && !/ваканси/i.test(t)) {
+    t = `${t} Какие вакансии у вас доступны?`;
   }
-  return sessionState.get(sid);
+  return forceMasculine(t);
 }
 
-function bumpEvidence(sid, key, details){
-  const S = getState(sid);
-  const rec = S.seenEvidences.get(key) || { count: 0, lastAt: 0 };
-  rec.count += 1;
-  rec.lastAt = Date.now();
-  S.seenEvidences.set(key, rec);
-  if (details && typeof details === 'object') {
-    S.evidenceDetails[key] = { ...(S.evidenceDetails[key]||{}), ...details };
-  }
-  return rec.count;
-}
-function evidenceCountUnique(sid){
-  return getState(sid).seenEvidences.size;
-}
-function hasEvidence(sid, key){
-  return getState(sid).seenEvidences.has(key);
-}
+/* ──────────────────────────────────────────────────────────────
+   ЧАСТЬ 5. LLM: сборка сообщений, ретраи, пост-правила
+   ────────────────────────────────────────────────────────────── */
 
-// ---------- Сборка сообщений в LLM ----------
 function buildMessages({ history = [], message, trust, evidences, evidenceDetails }) {
   const sys = {
     role: 'system',
@@ -299,56 +359,65 @@ function buildMessages({ history = [], message, trust, evidences, evidenceDetail
       PRICEBOOK + `\n` +
       `Правила: Demand Letter — это запрос/описание вакансии (без реквизитов работодателя). ` +
       `Реквизиты и стоимость — только в контракте о сотрудничестве/инвойсе. ` +
+      `Запрещено требовать "контракт работодателя" или "реквизиты работодателя" — нужен ТОЛЬКО наш B2B-контракт. ` +
       `Отвечай СТРОГО одним JSON-объектом. Будь кратким (до ${MAX_SENTENCES} предложений).`
   };
-  const trimmed = (history||[]).slice(-12).map(h => ({
-    role: h.role, content: h.content
-  }));
+  const trimmed = (history||[]).slice(-12).map(h => ({ role: h.role, content: h.content }));
   return [sys, ...trimmed, { role: 'user', content: message }];
 }
 
-// ---------- Обёртка с ретраями ----------
 async function createChatWithRetry(payload, tries = 2) {
   let lastErr;
   while (tries--) {
-    try {
-      return await groq.chat.completions.create(payload);
-    } catch (e) {
-      lastErr = e;
-    }
+    try { return await groq.chat.completions.create(payload); }
+    catch (e) { lastErr = e; }
   }
   throw lastErr;
 }
 
-// ---------- Объективатор «человечных» возражений ----------
-function chooseObjection({ sid, userText='', trust=0, uniqEvidence=0, hasDemand=false, hasCoop=false, stage='Contract' }){
+/** Жёсткий редиректор любых формулировок «контракта/реквизитов работодателя» в «наш B2B контракт» */
+function redirectEmployerContractToCoop(text=''){
+  let t = String(text || '');
+  // Явные формулировки «контракт работодателя / employer contract»
+  t = t.replace(
+    /\b(контракт(?!\s*о\s*сотрудничестве)[^.!?\n]*\b(работодател[ьяею]|employer|company)[^.!?\n]*)/gi,
+    'контракт о сотрудничестве (наш B2B)'
+  );
+  // Любые «реквизиты работодателя / employer details»
+  t = t.replace(
+    /\b(реквизит\w*\s*(работодател[ьяею]|employer|company)|employer\s*(details|requisites))\b/gi,
+    'реквизиты для инвойса (наши B2B)'
+  );
+  // Смягчаем косвенные упоминания «документы работодателя»
+  t = t.replace(
+    /\b(документ\w*\s*(работодател[ьяею]|employer|company))\b/gi,
+    'B2B-документы по сотрудничеству'
+  );
+  return t;
+}
+
+// «человечные» возражения на низком доверии
+function chooseObjection({ sid, userText='', trust=0, uniqEvidence=0, hasDemand=false, hasCoop=false }){
   const S = getState(sid);
   const rnd = seededRand(sid);
-  const hasPriceTalk = /(цена|стоим|дорог|price|€|eur|евро)/i.test(userText);
-  const asksPayFirst = /(оплат|сч[её]т|инвойс|плат[её]ж|предоплат)/i.test(userText);
-  const mentionsPermit = /(разрешен(ие|я)\s+на\s+работ|work\s*permit|zaměstnanecká|povolen[ií])/i.test(userText);
-  const mentionsSlots = /(слот|очеред|термин|запис)/i.test(userText);
+  const hasPriceTalk   = /(цена|стоим|дорог|price|€|eur|евро)/i.test(userText);
+  const mentionsPermit = /(разрешен(ие|я)\s+на\s*работ|work\s*permit|zaměstnanecká|povolen[ií])/i.test(userText);
+  const mentionsSlots  = /(слот|очеред|термин|запис)/i.test(userText);
 
-  // Пулы возражений
   const poolBudget = [
-    'Честно, для меня это сейчас высоко. Давайте начнём с одного кандидата и закрепим результат.',
+    'Честно, для меня это сейчас дорого. Давайте начнём с одного кандидата и закрепим результат.',
     'Пока не готов закрывать всю сумму — покажите, как пройдёт первый кейс, и двинемся дальше.',
     'Дорого выходит на старте. Снизим риски: один кандидат, остальное — после подтверждения хода дела.'
   ];
   const poolAfterPermit = [
     'Готов оплатить после разрешения на работу или хотя бы подтверждения регистрации.',
-    'Оплачу, когда увижу продвижение по разрешению на работу — до этого хочу минимизировать риски.',
-    'Как только будет подтверждение по разрешению/регистрации, перейду к оплате без задержек.'
-  ];
-  const poolNoCandidates = [
-    'Сейчас подходящих кандидатов у меня нет — дайте неделю на подбор, и вернусь с конкретикой.',
-    'По моей сетке сейчас пусто. Возьму паузу на 5–7 дней, соберу профили и выйду с предложениями.',
-    'Мне нужно время сформировать первую пару кандидатов. Вернусь с профилями в течение недели.'
+    'Оплачу, когда увижу разрешению на работу — до этого хочу минимизировать риски.',
+    'Как только будет подтверждение по регистрации в посольство, перейду к оплате без задержек.'
   ];
   const poolSlots = [
-    'Вижу, что со слотами нестабильно. Предлагаю стартовать с 1–2 кандидатов без полной предоплаты.',
-    'Давайте зафиксируем стартовый объём (1–2 кандидата), а оплату расширим после подтверждения слотов.',
-    'Сначала слоты/запись — потом увеличим объём и финансирование. Так будет безопаснее.'
+    'Вижу, что с регестрацией в посольство нестабильно сейчас. Предлагаю стартовать с 1 кандидатом без предоплаты, оплачу после визы.',
+    'Давайте зафиксируем двух кандидат, а оплату расширим после того как получу от Вас PDF файл.',
+    'Сначала запись — потом увеличим объём и финансирование. Так будет безопаснее.'
   ];
   const poolGeneric = [
     'Давайте начнём осторожно: один кандидат, остальное — после промежуточной проверки.',
@@ -356,33 +425,19 @@ function chooseObjection({ sid, userText='', trust=0, uniqEvidence=0, hasDemand=
     'Готов продолжить, но пока без полной оплаты. Покажите движение по документам — и закрываем счёт.'
   ];
   const poolDelay = [
-    'Возьму неделю на внутреннее согласование и подбор. Напишу вам в этот же чат.',
+    'Возьму неделю на внутреннее согласование и подбор вам персонала. Напишу вам в этот же чат.',
     'Нужно до 5 рабочих дней на проверку и сбор кандидатов. Вернусь с апдейтом.',
-    'Поставлю себе напоминание на следующую неделю и вернусь с первыми профилями.'
+    'Поставлю себе напоминание на следующую неделю и вернусь к вам.'
   ];
 
-  // Выбор стратегии
   let chosen = '';
-  if (hasPriceTalk) {
-    chosen = poolBudget[Math.floor(rnd()*poolBudget.length)];
-  }
-  if (!chosen && mentionsPermit) {
-    chosen = poolAfterPermit[Math.floor(rnd()*poolAfterPermit.length)];
-  }
-  if (!chosen && mentionsSlots) {
-    chosen = poolSlots[Math.floor(rnd()*poolSlots.length)];
-  }
-  if (!chosen && uniqEvidence < 2) {
-    chosen = poolGeneric[Math.floor(rnd()*poolGeneric.length)];
-  }
-  if (!chosen && trust < 60) {
-    chosen = poolDelay[Math.floor(rnd()*poolDelay.length)];
-  }
-  if (!chosen) {
-    chosen = poolGeneric[Math.floor(rnd()*poolGeneric.length)];
-  }
+  if (hasPriceTalk)        chosen = poolBudget[Math.floor(rnd()*poolBudget.length)];
+  if (!chosen && mentionsPermit) chosen = poolAfterPermit[Math.floor(rnd()*poolAfterPermit.length)];
+  if (!chosen && mentionsSlots)  chosen = poolSlots[Math.floor(rnd()*poolSlots.length)];
+  if (!chosen && uniqEvidence < 2) chosen = poolGeneric[Math.floor(rnd()*poolGeneric.length)];
+  if (!chosen && trust < 60)       chosen = poolDelay[Math.floor(rnd()*poolDelay.length)];
+  if (!chosen)                      chosen = poolGeneric[Math.floor(rnd()*poolGeneric.length)];
 
-  // Анти-повтор за ход
   if (S.lastObjection && S.lastObjection.toLowerCase() === chosen.toLowerCase()) {
     const alt = [...poolGeneric, ...poolBudget, ...poolAfterPermit, ...poolSlots, ...poolDelay]
       .filter(x => x.toLowerCase() !== chosen.toLowerCase());
@@ -390,36 +445,28 @@ function chooseObjection({ sid, userText='', trust=0, uniqEvidence=0, hasDemand=
   }
   S.lastObjection = chosen;
 
-  // Подклейка мягкого next-step, чтобы не «виснуть»
   let nudge = '';
-  if (!hasDemand) {
-    nudge = 'Скиньте Demand Letter с описанием вакансий — от него оттолкнёмся.';
-  } else if (!hasCoop) {
-    nudge = 'Нужен полный контракт о сотрудничестве — проверю условия и вернусь по оплате.';
-  } else if (uniqEvidence < 2) {
-    nudge = 'У меня нет сейчас своюодных кандидатов для Вас';
-  } else {
-    nudge = 'Начнём с одного кандидата и параллельно согласуем инвойс по этапам.';
-  }
+  if (!hasDemand) nudge = 'Скиньте Demand Letter с описанием вакансий — от него оттолкнёмся.';
+  else if (!hasCoop) nudge = 'Нужен полный контракт о сотрудничестве B2B — проверю условия и вернусь по оплате.';
+  else if (uniqEvidence < 2) nudge = 'Сейчас нет свободных кандидатов — вернусь с подборкой через неделю.';
+  else nudge = 'Начнём с одного кандидата и параллельно согласуем оплату по этапам.';
 
-  // Этап в зависимости от того, чего не хватает
   let stageSuggestion = 'Contract';
   if (!hasDemand) stageSuggestion = 'Demand';
   else if (!hasCoop) stageSuggestion = 'Contract';
   else if (uniqEvidence < 2) stageSuggestion = 'Candidate';
   else stageSuggestion = 'Payment';
 
-  return {
-    text: joinUniqueSentences([chosen, nudge]),
-    stage: stageSuggestion
-  };
+  return { text: joinUniqueSentences([chosen, nudge]), stage: stageSuggestion };
 }
 
-// ---------- Пост-правила ----------
+// пост-правила
 function postRules({ parsed, trust, evidences, history, userText, sid, evidenceDetails }) {
   const S = getState(sid);
 
-  // Новые пруфы ТОЛЬКО в этом запросе
+  // 0) Нормализуем вход пользователя: насильно уводим от «контракта работодателя»
+  userText = redirectEmployerContractToCoop(userText);
+
   const inc = new Set((evidences || []).filter(k => !S.seenEvidences.has(k)));
 
   let reply = String(parsed.reply || '').trim();
@@ -431,7 +478,7 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     parsed.stage ??= 'Greeting';
   }
 
-  // Регистрации/слоты — консистентный ответ
+  // Регистрации/слоты
   if (/(когда|последн).*(регистрир|записыва)|слот|очеред/i.test(userText)) {
     reply = registrationAnswer();
     parsed.stage = 'Demand';
@@ -439,23 +486,43 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     parsed.suggestedActions = ['ask_demands','ask_coop_contract'];
   }
 
-  // --- Greeting rewrite: продавец кандидатов, а не соискатель ---
-  // Если это первое касание/приветствие, исправляем формулировку под «Какие вакансии у вас доступны?»
+  // Greeting rewrite
   const isEarly = (history || []).length <= 2 || (!parsed.stage || parsed.stage === 'Greeting');
   if (isEarly) {
     const userName = extractUserName({ history, evidenceDetails });
     reply = craftHumanGreeting({ base: reply, name: userName });
     parsed.stage = 'Greeting';
   } else {
-    // Даже позже — выправляем ошибочную роль, если «какие вакансии вы ищете»
     reply = rewriteVacancyQuestionToSupplierRole(reply);
   }
 
-  // Вопрос про кол-во кандидатов
+  // Ответы на базовые вопросы из DEMAND
+  const DF = getDemandFacts(sid);
+  const askedSalary = /(зарплат|salary|сколько.*(получ|net))/i.test(userText);
+  const askedHouse  = /(жиль|accommodat|общежит|проживан)/i.test(userText);
+  const askedHours  = /(график|час(ов)?\s*в\s*месяц|смен|working\s*hours|work\s*time)/i.test(userText);
+  const askedLoc    = /(локац|город|место|location|where)/i.test(userText);
+  const askedWhatJob= /(что\s+делать|обязан|описани[ея]\s+работ|job\s*description)/i.test(userText);
+  if (Object.keys(DF).length) {
+    if (askedSalary) { reply = formatFactsShort(DF,'salary') || reply; parsed.stage ??= 'Demand'; }
+    else if (askedHouse) { reply = formatFactsShort(DF,'accommodation') || reply; parsed.stage ??= 'Demand'; }
+    else if (askedHours) { reply = formatFactsShort(DF,'hours') || reply; parsed.stage ??= 'Demand'; }
+    else if (askedLoc)   { reply = formatFactsShort(DF,'location') || reply; parsed.stage ??= 'Demand'; }
+    else if (askedWhatJob) { reply = formatFactsShort(DF,'all') || reply; parsed.stage ??= 'Demand'; }
+  }
+  // Изредка уточняем один пункт (12%)
+  const rndProbe = seededRand(sid)();
+  if (Object.keys(DF).length && rndProbe < 0.12) {
+    if (!DF.salary?.value) reply = joinUniqueSentences([reply, 'Уточню: нетто ставка по этой позиции какая?']);
+    else if (!DF.hours_monthly && !DF.schedule) reply = joinUniqueSentences([reply, 'Уточню график: сколько часов в месяц/смены?']);
+    else if (!DF.accommodation?.cost_eur) reply = joinUniqueSentences([reply, 'Жильё: напомните ориентир по стоимости?']);
+  }
+
+  // Вопрос про количество кандидатов
   const askCandidates = /(сколько.*кандидат|кандидат(ов)?\s*(есть|готов|подад)|сколько человек будем подавать)/i.test(userText);
   if (askCandidates) {
     if (hasEvidence(sid,'demand_letter') && hasEvidence(sid,'coop_contract_pdf')) {
-      reply = 'Готов подать 1–2 кандидата на старт в Чехию. Остальные — после регестрации и в посольвто.';
+      reply = 'Готов подать 1–2 кандидата на старт в Чехию. Остальные — после регистрации в посольство.';
       parsed.stage = parsed.stage === 'Payment' ? 'Payment' : 'Candidate';
       parsed.needEvidence = false;
       setActions.add('invoice_request');
@@ -470,17 +537,24 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     }
   }
 
-  // ====== Тихая фиксация приходящих материалов (без роботских «получил») ======
+  // Тихая фиксация материалов
   if (inc.has('business_card') || (evidenceDetails && evidenceDetails.business_card)) {
     bumpEvidence(sid, 'business_card', evidenceDetails?.business_card);
   }
   if (inc.has('demand_letter')) {
     bumpEvidence(sid, 'demand_letter');
+    const facts = extractDemandFactsFromDetails(evidenceDetails || {});
+    if (Object.keys(facts).length) setDemandFacts(sid, facts);
+
     if (!hasEvidence(sid,'coop_contract_pdf')) {
       setActions.add('ask_coop_contract');
       parsed.stage = 'Contract';
       parsed.needEvidence = true;
-      reply = joinUniqueSentences([reply, 'Я расмотрел ваш запрос, не знаю смогу ли я подобрать вам персонал, это тяжолое направления, не возможно получить назначения сейчас в Индии.']);
+      reply = joinUniqueSentences([reply,
+        'Запрос вижу. Направление сложное: по Индии сейчас с регестрацией в посольство вобше нестабильно. Начнём с одного кандидата, остальные — после подтверждения записи.'
+      ]);
+    } else {
+      reply = joinUniqueSentences([reply, formatFactsShort(getDemandFacts(sid), 'all') || '']);
     }
   }
   if (inc.has('sample_contract_pdf')) {
@@ -489,7 +563,7 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
       setActions.add('ask_coop_contract');
       parsed.stage = 'Contract';
       parsed.needEvidence = true;
-      reply = joinUniqueSentences([reply, 'Отправте мне пожалуйста договор B2B']);
+      reply = joinUniqueSentences([reply, 'Отправьте, пожалуйста, полный договор B2B.']);
     }
   }
   if (inc.has('coop_contract_pdf')) {
@@ -497,13 +571,13 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     parsed.stage = 'Contract';
     parsed.needEvidence = false;
     setActions.add('ask_price_breakdown');
-    reply = joinUniqueSentences([reply, 'Контракт вижу. Могу перейти к оплате.']);
+    reply = joinUniqueSentences([reply, 'Спасибо, как изучу вернусь к вам.']);
   }
   for (const key of ['visa_sample','presentation','video','website','company_registry','reviews','registry_proof','price_breakdown','slot_plan','invoice_template','nda']) {
     if (inc.has(key)) bumpEvidence(sid, key, evidenceDetails?.[key]);
   }
 
-  // ====== Политика оплаты — только банк ======
+  // Политика оплаты — только банк
   if (/(банк|банковск|crypto|крипто|usdt|btc|eth|криптовалют)/i.test(userText) && /оплат|плат[её]ж|инвойс|сч[её]т/i.test(userText)) {
     reply = 'Банковский инвойс. Криптовалюту не принимаем.';
     setActions.add('invoice_request');
@@ -511,49 +585,48 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     parsed.needEvidence = false;
   }
 
-  // ====== Новый блок: «человечные» возражения при низком доверии ======
+  // Возражения при низком доверии
   const uniqEvidence = evidenceCountUnique(sid);
   const hasDemand = hasEvidence(sid,'demand_letter');
   const hasCoop   = hasEvidence(sid,'coop_contract_pdf');
-
   if (parsed.stage === 'Payment' && trust < 90) {
-    const obj = chooseObjection({
-      sid, userText, trust,
-      uniqEvidence, hasDemand, hasCoop,
-      stage: parsed.stage
-    });
+    const obj = chooseObjection({ sid, userText, trust, uniqEvidence, hasDemand, hasCoop });
     reply = obj.text;
-    // если ещё нет базовых документов — просим их, но без «роботских» подтверждений
     parsed.stage = obj.stage;
     parsed.needEvidence = !hasDemand || !hasCoop || uniqEvidence < 2;
-
-    // действия: аккуратно направляем, без навязчивости
     if (!hasDemand) setActions.add('ask_demands');
     if (!hasCoop) setActions.add('ask_coop_contract');
     if (hasCoop) setActions.add('ask_price_breakdown');
   }
 
-  // ====== Санитария текста (убираем лишнее и «робота») ======
-  reply = stripEmployerRequisitesRequests(reply); // не просим «реквизиты работодателя»
-  reply = stripRequisitesFromDemand(reply);       // не просим «реквизиты из Demand»
-  reply = stripRoboticAcks(reply);                // убираем «спасибо/получил X»
+  // Если ответ снова спрашивает базовые вещи, а факты есть — подменим на факты
+  if (Object.keys(DF).length) {
+    if (/какая\s+зарплат/i.test(reply)) reply = formatFactsShort(DF,'salary') || reply;
+    if (/есть\s+ли\s+жиль|жиль[её]\s+будет|стоимость\s+жиль/i.test(reply)) reply = formatFactsShort(DF,'accommodation') || reply;
+    if (/график|сколько\s+час/i.test(reply)) reply = formatFactsShort(DF,'hours') || reply;
+    if (/какая\s+локац|где\s+работ/i.test(reply)) reply = formatFactsShort(DF,'location') || reply;
+  }
+
+  // Санитария (+ жёсткий редиректор на наш B2B)
+  reply = redirectEmployerContractToCoop(reply);
+  reply = stripEmployerRequisitesRequests(reply);
+  reply = stripRequisitesFromDemand(reply);
+  reply = stripRoboticAcks(reply);
   reply = cleanSales(reply);
   reply = forceMasculine(reply);
   reply = limitSentences(reply, MAX_SENTENCES);
 
   // Анти-луп
   if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) {
-    reply = 'Предлагаю стартовать с одного кандидата. Документы проверю и вернусь с оплатой.';
+    reply = 'Предлагаю стартовать с одного кандидата. Документы проверю и дальше будем работать по прайсу.';
     parsed.stage = hasCoop ? 'Payment' : 'Contract';
     if (!hasCoop) { setActions.add('ask_coop_contract'); parsed.needEvidence = true; }
     setActions.add('test_one_candidate');
   }
   S.lastReply = reply;
 
-  // Финальные ворота — контракт + ≥2 уникальных пруфа + trust≥90
-  const uniqEvidenceCount = uniqEvidence;
-  const hasCoopNow = hasCoop;
-  const gatesOk = (trust >= 90 && uniqEvidenceCount >= 2 && hasCoopNow);
+  // Финальные ворота
+  const gatesOk = (trust >= 90 && evidenceCountUnique(sid) >= 2 && hasEvidence(sid,'coop_contract_pdf'));
   if (gatesOk) {
     setActions.add('invoice_request');
     if (!/инвойс|сч[её]т|реквизит/i.test(reply)) {
@@ -566,7 +639,6 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   parsed.reply = reply.trim();
   parsed.suggestedActions = normalizeActions(Array.from(setActions));
 
-  // Если просим документы — stage не ниже Demand
   if (/(demand|контракт|документ|полный контракт|сотрудничеств)/i.test(parsed.reply) && (!parsed.stage || parsed.stage === 'Greeting')) {
     parsed.stage = 'Demand';
   }
@@ -574,16 +646,20 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   return parsed;
 }
 
-// ---------- Вызов LLM ----------
 async function runLLM({ history, message, evidences, stage, sessionId='default', evidenceDetails }) {
   const trust = computeTrust({
     baseTrust: 20,
-    evidences: Array.from(new Set(evidences || [])), // только уникальные ключи влияют
+    evidences: Array.from(new Set(evidences || [])),
     history: history || [],
     lastUserText: message || ''
   });
 
-  const messages = buildMessages({ history, message, trust, evidences, evidenceDetails });
+  // Входной текст также нормализуем (никаких «контрактов работодателя»)
+  const safeMessage = redirectEmployerContractToCoop(message || '');
+
+  const messages = buildMessages({
+    history, message: safeMessage, trust, evidences, evidenceDetails
+  });
 
   const resp = await createChatWithRetry({
     model: MODEL,
@@ -615,7 +691,7 @@ async function runLLM({ history, message, evidences, stage, sessionId='default',
     };
   }
 
-  // Страховки типов
+  // типобезопасность
   parsed.reply = String(parsed.reply || '').trim();
   parsed.stage = String(parsed.stage || stage || "Greeting");
   parsed.confidence = clamp(Number(parsed.confidence ?? trust), 0, 100);
@@ -628,7 +704,7 @@ async function runLLM({ history, message, evidences, stage, sessionId='default',
     trust,
     evidences,
     history,
-    userText: message || '',
+    userText: safeMessage,
     sid: sessionId || 'default',
     evidenceDetails
   });
@@ -636,7 +712,10 @@ async function runLLM({ history, message, evidences, stage, sessionId='default',
   return { trust, evidenceCount: evidenceCountUnique(sessionId), result: parsed };
 }
 
-// ---------- Root & assets ----------
+/* ──────────────────────────────────────────────────────────────
+   ЧАСТЬ 6. РОУТЫ: root/assets, API, совместимость
+   ────────────────────────────────────────────────────────────── */
+
 app.get('/', (_, res) => {
   res.type('html').send(`<!doctype html>
 <meta charset="utf-8">
@@ -665,7 +744,6 @@ app.get(['/apple-touch-icon.png','/apple-touch-icon-precomposed.png'], (req, res
   res.send(emptyPng);
 });
 
-// ---------- Совместимость с фронтом ----------
 app.get('/api/ping', (_, res) => res.json({ ok: true }));
 
 function sanitizeHistory(arr){
@@ -676,25 +754,15 @@ function sanitizeHistory(arr){
   })) : [];
 }
 
-// Нормализация ключей доказательств из фронта
 function normalizeEvidenceKey(k){
   const key = String(k || '').toLowerCase().trim();
   const map = new Map([
-    // Business card / визитка менеджера
     ['card','business_card'], ['визитка','business_card'], ['business_card','business_card'],
-
-    // Demand
     ['demand','demand_letter'], ['demandletter','demand_letter'], ['деманд','demand_letter'],
-
-    // Contracts
     ['sample','sample_contract_pdf'], ['sample_contract','sample_contract_pdf'],
     ['contract_sample','sample_contract_pdf'], ['пример_контракта','sample_contract_pdf'],
-    ['contract_pdf','coop_contract_pdf'], // алиас со старого фронта
-    ['contract','coop_contract_pdf'], ['contractpdf','coop_contract_pdf'], ['договор','coop_contract_pdf'],
-    ['coop_contract','coop_contract_pdf'], ['full_contract','coop_contract_pdf'],
-    ['контракт_о_сотрудничестве','coop_contract_pdf'],
-
-    // Other proofs
+    ['contract_pdf','coop_contract_pdf'], ['contract','coop_contract_pdf'], ['contractpdf','coop_contract_pdf'], ['договор','coop_contract_pdf'],
+    ['coop_contract','coop_contract_pdf'], ['full_contract','coop_contract_pdf'], ['контракт_о_сотрудничестве','coop_contract_pdf'],
     ['visa','visa_sample'], ['visa_scan','visa_sample'], ['пример_визы','visa_sample'], ['visa_sample','visa_sample'],
     ['site','website'], ['сайт','website'], ['website','website'],
     ['reviews','reviews'], ['отзывы','reviews'],
@@ -706,13 +774,7 @@ function normalizeEvidenceKey(k){
   return map.get(key) || key;
 }
 
-// ---------- /api/reply ----------
-/*
-  Доп. поля:
-  — evidence_details (object), например:
-     { business_card: { name, phone, email, office, company }, website:{ url } }
-  — evidence (число) — совместимость со старым фронтом (генерит proof_1..N)
-*/
+/* /api/reply */
 app.post('/api/reply', async (req, res) => {
   try {
     const b = req.body || {};
@@ -760,7 +822,7 @@ app.post('/api/reply', async (req, res) => {
   }
 });
 
-// ---------- /api/score ----------
+/* /api/score */
 app.post('/api/score', (req, res) => {
   try {
     const b = req.body || {};
@@ -801,7 +863,7 @@ app.post('/api/score', (req, res) => {
   }
 });
 
-// ---------- Совместимость со старым роутом ----------
+/* совместимость со старым роутом */
 app.post('/chat', async (req, res) => {
   try {
     const data = ChatSchema.parse({
@@ -827,6 +889,9 @@ app.post('/chat', async (req, res) => {
 
 app.get('/health', (_, res) => res.json({ ok: true }));
 
-// ---------- Start ----------
+/* ──────────────────────────────────────────────────────────────
+   ЧАСТЬ 7. СТАРТ
+   ────────────────────────────────────────────────────────────── */
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`LLM backend running on :${PORT}`));
