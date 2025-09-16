@@ -442,6 +442,23 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     parsed.stage = 'Demand';
   }
 
+  // --- Fallback если после всех правил ответ пустой ---
+  if (!reply || reply.length < 2) {
+    reply = 'Слушаю вас. Расскажите подробнее.';
+    parsed.stage ??= 'Greeting';
+  }
+
+  parsed.reply = reply.trim();
+  parsed.suggestedActions = normalizeActions(
+    Array.from(new Set([...(parsed.suggestedActions||[]), ...setActions]))
+  );
+
+  // Если просим документы — stage не ниже Demand
+  if (/(demand|контракт|документ|полный контракт|сотрудничеств)/i.test(parsed.reply) &&
+      (!parsed.stage || parsed.stage === 'Greeting')) {
+    parsed.stage = 'Demand';
+  }
+
   return { parsed, trust: S.scores.trust };
 }
 
