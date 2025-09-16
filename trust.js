@@ -153,14 +153,14 @@ export function computeTrust({ baseTrust = 20, evidences = [], history = [], las
   // ===== 3) Тональность и сигналы последней фразы =====
   const tone = toneFromHistory(history);
   score += Math.min(4, tone.polite); // небольшой плюс за вежливость
-  score += tone.press;               // минусы за давление (из твоей функции)
+  score += tone.press;               // минусы за давление
   if (tone.obseq >= 2) score -= 3;   // чрезмерная угодливость снижает доверие слегка
 
   const sig = textSignals(lastUserText || '');
   for (const r of sig.red) {
     if (r === 'crypto_upfront')                 score -= 25;
     else if (r === 'impossible_guarantee')      score -= 30;
-    else if (r === 'pressure')                  score -= 16; // чуть мягче, чем было
+    else if (r === 'pressure')                  score -= 16; 
     else if (r === 'embassy_connections_claim') score -= 30;
     else if (r === 'unrealistic_timeline')      score -= 12;
     else if (r === 'fee_salary_confusion')      score -= 12;
@@ -173,40 +173,26 @@ export function computeTrust({ baseTrust = 20, evidences = [], history = [], las
   if (sig.green.includes('test_one_candidate'))    score += 2;
 
   // ===== 4) Микро-кредиты за «нормальный» диалог (без давления) =====
-  // +1 за каждую уникальную уточняющую тему (имя, офис, город, опыт, специализация, годы на рынке, регистрация)
-  // без капса – до +8 максимум
   const micro = dialogMicroCredits(history);
   score += Math.min(8, micro.uniqInfoKeysCount);
-  // если последние 5 пользовательских сообщений не давили на оплату до пруфов — ещё +1
   if (!micro.recentEarlyPayPressure) score += 1;
 
   // ===== 5) Нелинейные ворота (пересчитаны под новые веса) =====
-  // Gate 1: >30 требует минимум 1 тяжёлый пруф
-  if (score > 30 && hard < 1) score = 30;
-
-  // Gate 2: >60 требует (2×HARD) ИЛИ (1×HARD + 1×MEDIUM)
+  if (score > 30 && hard < 1) score = 30; // Gate 1
   const passGate2 = (hard >= 2) || (hard >= 1 && med >= 1);
-  if (score > 60 && !passGate2) score = 60;
-
-  // Gate 3: >75 требует 2×HARD и отсутствие красных флагов
-  if (score > 75 && (hard < 2 || sig.red.length > 0)) score = 75;
-
-  // Доп. наказание: ранний «Payment» до Gate3
+  if (score > 60 && !passGate2) score = 60; // Gate 2
+  if (score > 75 && (hard < 2 || sig.red.length > 0)) score = 75; // Gate 3
   if (sawPaymentStage && score < 75) score = Math.max(0, score - 8);
 
   // Финал
   return Math.round(clamp01_100(score));
 
-  // ===== Вспомогательные локальные =====
-
+  // ===== Вспомогательные =====
   function clamp01_100(x){ return Math.max(0, Math.min(100, Number(x) || 0)); }
 
-  // Вычисляем «микро-кредиты» за социальный, неагрессивный диалог
   function dialogMicroCredits(hist) {
-    // Берём последние до 12 сообщений пользователя
     const userMsgs = (hist || []).filter(m => String(m.role||'').toLowerCase()==='user').slice(-12);
 
-    // Регексы на уточнения-«биографию»
     const KEY_REGEXPS = {
       name: /(как.*зовут|вас зовут|имя|name)/i,
       office: /(офис|office|head\s*office|штаб|hq)/i,
@@ -217,7 +203,6 @@ export function computeTrust({ baseTrust = 20, evidences = [], history = [], las
       team: /(штат|сотрудник|сколько человек|команда|headcount|staff)/i
     };
 
-    // считаем уникальные ключи, по которым были заданы вопросы ИЛИ даны ответы
     const foundKeys = new Set();
     for (const m of userMsgs) {
       const t = (m.text || m.content || m.message || '').toString();
@@ -226,14 +211,13 @@ export function computeTrust({ baseTrust = 20, evidences = [], history = [], las
       }
     }
 
-    // Раннее давление на оплату без прохождения Gate2 — слегка штрафуем микробонусы
     const payRx = /(оплат|плат[её]ж|инвойс|сч[её]т| реквизит(ы)?)/i;
     const earlyPayHits = userMsgs.slice(-6).filter(m => payRx.test((m.text||m.content||'')+'')).length;
     const recentEarlyPayPressure = (earlyPayHits >= 2) && !passGate2;
 
     return {
-      uniqInfoKeysCount: foundKeys.size,      // до +8 в основном счёте
-      recentEarlyPayPressure                   // влияет на +1 в основном счёте
+      uniqInfoKeysCount: foundKeys.size,
+      recentEarlyPayPressure
     };
   }
 }
