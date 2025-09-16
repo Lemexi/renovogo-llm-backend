@@ -3,6 +3,7 @@ import 'dotenv/config';
 import express from 'express';
 import morgan from 'morgan';
 import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import { Groq } from 'groq-sdk';
 import { z } from 'zod';
 import { SYSTEM_PROMPT } from './prompt.js';
@@ -24,6 +25,15 @@ app.use(cors({
   },
   credentials: false
 }));
+
+// ---------- Rate limit ----------
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 мин
+  max: 30,             // 30 req/IP/мин
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api/', limiter);
 
 // ---------- Groq ----------
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -54,6 +64,15 @@ const ChatSchema = z.object({
   })).optional()
 });
 
+// Валидация ответа LLM (жёсткая)
+const LLMShape = z.object({
+  reply: z.string().min(1),
+  stage: z.enum(["Greeting","Demand","Candidate","Contract","Payment","Closing"]).optional(),
+  confidence: z.number().min(0).max(100).optional(),
+  needEvidence: z.boolean().optional(),
+  suggestedActions: z.array(z.string()).optional()
+});
+
 // ---------- Utils ----------
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 const pick  = (arr) => arr[Math.floor(Math.random() * arr.length)];
@@ -69,7 +88,11 @@ const extractFirstJsonObject = (s) => {
 const lastAssistantReplyFromHistory = (history=[]) =>
   String((history || []).filter(h => h.role==='assistant').slice(-1)[0]?.content || '').trim();
 
-// --- actions normalize ---
+function logError(err, ctx=''){
+  console.error(`[${new Date().toISOString()}] ${ctx}:`, err?.stack || err);
+}
+
+// --- actions normalize (урезали до нужных и согласовали с prompt.js) ---
 const ACTION_WHITELIST = [
   "invoice_request","ask_demands","ask_contract",
   "ask_price_breakdown","test_one_candidate","goodbye"
@@ -182,6 +205,20 @@ function buildMessages({ history = [], message, trust, evidences }) {
   return [sys, ...trimmed, { role: 'user', content: message }];
 }
 
+// ---------- Обёртка с ретраями и таймаутом ----------
+async function createChatWithRetry(payload, tries = 2) {
+  let lastErr;
+  while (tries--) {
+    try {
+      // sdk не всегда принимает второй аргумент опций — оставим один объект
+      return await groq.chat.completions.create(payload);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr;
+}
+
 // ---------- «Оживление» и бортики ----------
 function humanize({ parsed, trust, evidences, history }) {
   let reply = String(parsed.reply || '').trim();
@@ -262,7 +299,7 @@ function humanize({ parsed, trust, evidences, history }) {
 
 // ---------- Вызов LLM ----------
 async function runLLM({ history, message, evidences, stage }) {
-  // ВАЖНО: передаём ПОЛНУЮ историю (с текстами), чтобы trust учитывал тон
+  // ПОЛНАЯ история (с текстами), чтобы trust учитывал тон
   const trust = computeTrust({
     baseTrust: 20,
     evidences: evidences || [],
@@ -272,7 +309,7 @@ async function runLLM({ history, message, evidences, stage }) {
 
   const messages = buildMessages({ history, message, trust, evidences });
 
-  const resp = await groq.chat.completions.create({
+  const resp = await createChatWithRetry({
     model: MODEL,
     temperature: 0.35,
     top_p: 0.9,
@@ -283,15 +320,25 @@ async function runLLM({ history, message, evidences, stage }) {
     messages
   });
 
-  const raw = resp.choices?.[0]?.message?.content || '{}';
+  const raw = resp?.choices?.[0]?.message?.content || '{}';
   const json = extractFirstJsonObject(raw);
-  let parsed = json ?? {
-    reply: pick(FALLBACK_HUMAN),
-    confidence: clamp(trust, 0, 40),
-    stage: stage || "Greeting",
-    needEvidence: true,
-    suggestedActions: ["ask_demands","ask_contract"]
-  };
+
+  let parsed;
+  try {
+    parsed = LLMShape.parse(json);
+  } catch {
+    parsed = null;
+  }
+
+  if (!parsed) {
+    parsed = {
+      reply: pick(FALLBACK_HUMAN),
+      confidence: clamp(trust, 0, 40),
+      stage: stage || "Greeting",
+      needEvidence: true,
+      suggestedActions: ["ask_demands","ask_contract"]
+    };
+  }
 
   // Страховки типов
   parsed.reply = String(parsed.reply || '').trim();
@@ -339,31 +386,47 @@ app.get(['/apple-touch-icon.png','/apple-touch-icon-precomposed.png'], (req, res
 // ---------- Совместимость с фронтом ----------
 app.get('/api/ping', (_, res) => res.json({ ok: true }));
 
+// Нормализация входа (общая)
+function sanitizeHistory(arr){
+  return Array.isArray(arr) ? arr.slice(-50).map(h => ({
+    role: (h.role === 'assistant' ? 'assistant' : 'user'),
+    content: String(h.content || '').replace(/<[^>]+>/g, ''),
+    stage: h.stage ? String(h.stage) : undefined
+  })) : [];
+}
+function normalizeEvidenceKey(k){
+  const map = { contract:'contract_pdf', demand:'demand_letter', card:'business_card' };
+  return map[String(k || '')] || String(k || '');
+}
+
 // /api/reply — основной
 app.post('/api/reply', async (req, res) => {
   try {
     const b = req.body || {};
 
-    // Нормализация evidences
-    const evidences =
-      Array.isArray(b.evidences) ? b.evidences.map(String) :
-      (Number.isFinite(b.evidence) ? Array.from({ length: Math.max(0, b.evidence|0) }, (_, i) => `proof_${i+1}`) :
-      []);
+    // Сообщение
+    const rawMessage = String(b.user_text ?? b.message ?? '').trim();
+    if (!rawMessage || rawMessage.length > 2000) {
+      return res.status(400).json({ ok: false, error: 'Invalid message length' });
+    }
+
+    // Evidences
+    const evidences = Array.isArray(b.evidences)
+      ? [...new Set(b.evidences.map(normalizeEvidenceKey).filter(Boolean))]
+      : (Number.isFinite(b.evidence)
+          ? Array.from({ length: Math.max(0, b.evidence|0) }, (_, i) => `proof_${i+1}`)
+          : []);
 
     // История
-    const history = Array.isArray(b.history) ? b.history.map(h => ({
-      role: (h.role === 'assistant' ? 'assistant' : 'user'),
-      content: String(h.content || ''),
-      stage: h.stage ? String(h.stage) : undefined
-    })) : [];
+    const history = sanitizeHistory(b.history);
 
+    // Схема
     const dataForLLM = {
       sessionId: String(b.sessionId || 'default'),
-      message: String(b.user_text || ''),
+      message: rawMessage,
       evidences,
       history
     };
-
     const parsed = ChatSchema.partial({ stage: true }).parse(dataForLLM);
 
     const { trust, evidenceCount, result } = await runLLM({
@@ -386,7 +449,7 @@ app.post('/api/reply', async (req, res) => {
       }
     });
   } catch (e) {
-    console.error(e);
+    logError(e, '/api/reply');
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
@@ -395,12 +458,12 @@ app.post('/api/reply', async (req, res) => {
 app.post('/api/score', (req, res) => {
   try {
     const b = req.body || {};
-    const evidences =
-      Array.isArray(b.evidences) ? b.evidences.map(String) :
-      (Number.isFinite(b.evidence) ? Array.from({ length: Math.max(0, b.evidence|0) }, (_, i) => `proof_${i+1}`) :
-      []);
-
-    const history = Array.isArray(b.history) ? b.history : [];
+    const evidences = Array.isArray(b.evidences)
+      ? [...new Set(b.evidences.map(normalizeEvidenceKey).filter(Boolean))]
+      : (Number.isFinite(b.evidence)
+          ? Array.from({ length: Math.max(0, b.evidence|0) }, (_, i) => `proof_${i+1}`)
+          : []);
+    const history = sanitizeHistory(b.history);
     const lastUserText = history.filter(h => h.role === 'user').slice(-1)[0]?.content || '';
 
     // считаем trust с ПОЛНОЙ историей (тон)
@@ -423,9 +486,12 @@ app.post('/api/score', (req, res) => {
       (/(контракт|сч[её]т|инвойс|готовы начать)/i.test(msgText) ? 35 : 0)
     ), 0, 100);
 
+    // согласованная подсказка по «воротам»
+    if (trust < 80) bad.push('Для предметного обсуждения добавьте документы (Demand/Contract/Registry).');
+
     res.json({ final, good, bad, trust, evidences: evidences.length });
   } catch (e) {
-    console.error(e);
+    logError(e, '/api/score');
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
@@ -433,7 +499,13 @@ app.post('/api/score', (req, res) => {
 // Совместимость со старым роутом
 app.post('/chat', async (req, res) => {
   try {
-    const data = ChatSchema.parse(req.body);
+    const data = ChatSchema.parse({
+      sessionId: String(req.body?.sessionId || 'default'),
+      message: String(req.body?.message || '').trim(),
+      stage: req.body?.stage,
+      evidences: Array.isArray(req.body?.evidences) ? req.body.evidences.map(normalizeEvidenceKey) : [],
+      history: sanitizeHistory(req.body?.history)
+    });
     const { trust, evidenceCount, result } = await runLLM({
       history: data.history,
       message: data.message,
@@ -442,7 +514,7 @@ app.post('/chat', async (req, res) => {
     });
     res.json({ ok: true, trust, evidenceCount, result });
   } catch (e) {
-    console.error(e);
+    logError(e, '/chat');
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
