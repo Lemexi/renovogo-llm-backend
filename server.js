@@ -69,7 +69,7 @@ const extractFirstJsonObject = (s) => {
 const lastAssistantReplyFromHistory = (history=[]) =>
   String((history || []).filter(h => h.role==='assistant').slice(-1)[0]?.content || '').trim();
 
-// --- actions normalize (урезали до нужных) ---
+// --- actions normalize ---
 const ACTION_WHITELIST = [
   "invoice_request","ask_demands","ask_contract",
   "ask_price_breakdown","test_one_candidate","goodbye"
@@ -112,7 +112,7 @@ const TOO_EARLY_PAY_HUMAN = [
   "Не торопите события: проверки → потом инвойс."
 ];
 
-// тематические подсказки (урезано до нужного)
+// тематические подсказки
 const CRYPTO_SKEPTIC = [
   "Крипта — риск. Предпочитаю счёт-фактуру и банковский перевод.",
   "Крипта? Не лучший знак. Давайте нормальный инвойс.",
@@ -135,6 +135,25 @@ const CLOSING_READY = [
   "Хорошо, финализируем.",
   "Ок, шлите инвойс — проверю и двинемся.",
   "Готово. Жду реквизиты и счёт."
+];
+
+// МЯГКИЕ РЕПЛИКИ ДЛЯ GREETING (по доверию)
+const GREETING_SOFT = [
+  "Виктор, рад знакомству. Спасибо за визитку — гляну. Чем вы обычно помогаете, какие направления сильнее всего?",
+  "Приятно познакомиться. Сайт открыт, посмотрю. Коротко: с какими работодателями вы чаще работаете?",
+  "Спасибо, принял визитку. Расскажите, какие у вас сейчас основные вакансии и условия?"
+];
+
+const GREETING_INQUIRY = [
+  "Вижу сайт. Чтобы понимать масштаб: с какими регионами/отраслями вы работаете чаще всего?",
+  "Ок, принял. По вакансиям: это в основном CZ, PL? По зарплатам — какой коридор предлагаете?",
+  "Супер. Тогда сориентируйте: какие документы обычно готовите на старте, кто подписывает?"
+];
+
+const GREETING_PRO = [
+  "Посмотрел визитку. Давайте предметно: какие вакансии готовы закрыть первыми и на каких условиях?",
+  "Окей. Какие документы готовы предоставить в первую очередь и кто работодатель?",
+  "Договорились. Кого можем протестировать первым кандидатом и что по ставке?"
 ];
 
 // Запретные паттерны
@@ -170,6 +189,24 @@ function humanize({ parsed, trust, evidences, history }) {
   const uniqEvidenceCount = new Set(evidences || []).size;
   const gatesOk = (trust >= 90 && uniqEvidenceCount >= 2);
 
+  // Greeting: если только лёгкие пруфы (визитка/сайт) — мягко общаемся, не требуем контракт сразу
+  const onlyLightProofs = uniqEvidenceCount >= 1 && !(evidences || []).some(e =>
+    ['demand_letter','contract_pdf'].includes(String(e).toLowerCase())
+  );
+
+  const userText = (history || []).filter(h=>h.role==='user').slice(-1)[0]?.content || '';
+
+  if ((parsed.stage === 'Greeting' || !parsed.stage) && onlyLightProofs) {
+    if (trust < 40)       reply = pick(GREETING_SOFT);
+    else if (trust < 70)  reply = pick(GREETING_INQUIRY);
+    else                  reply = pick(GREETING_PRO);
+
+    parsed.stage = 'Greeting';
+    parsed.needEvidence = false;
+    parsed.suggestedActions = ["ask_demands","ask_contract","ask_price_breakdown"];
+    parsed.confidence = Math.max(parsed.confidence ?? 0, Math.min(70, trust));
+  }
+
   // Запрещённые фразы → перехват в документы
   if (!reply || BANNED_PATTERNS.some(rx => rx.test(reply))) {
     reply = pick(ASK_DOCS_HUMAN);
@@ -190,8 +227,7 @@ function humanize({ parsed, trust, evidences, history }) {
     parsed.confidence = Math.min(parsed.confidence ?? trust, 80);
   }
 
-  // Подталкивания по последнему тексту пользователя (урезано)
-  const userText = (history || []).filter(h=>h.role==='user').slice(-1)[0]?.content || '';
+  // Подталкивания по последнему тексту пользователя
   if (/крипт|crypto|usdt|btc/i.test(userText)) reply ||= pick(CRYPTO_SKEPTIC);
   if (/сколько|цена|дорог|ценник|стоим/i.test(userText)) reply ||= pick(BARGAIN);
   if (/кандидат|people|workers|людей|тест/i.test(userText)) reply ||= pick(CANDIDATE_TEST);
@@ -212,8 +248,8 @@ function humanize({ parsed, trust, evidences, history }) {
     reply = pick(FALLBACK_HUMAN);
   }
 
-  parsed.reply = trimToSentences(reply, 6);
-  if (!parsed.reply) parsed.reply = pick(FALLBACK_HUMAN);
+  // Финальный штрих
+  parsed.reply = trimToSentences(reply, 6) || pick(FALLBACK_HUMAN);
   parsed.suggestedActions = normalizeActions(parsed.suggestedActions);
 
   // Если просим документы — stage не ниже Demand
@@ -226,10 +262,11 @@ function humanize({ parsed, trust, evidences, history }) {
 
 // ---------- Вызов LLM ----------
 async function runLLM({ history, message, evidences, stage }) {
+  // ВАЖНО: передаём ПОЛНУЮ историю (с текстами), чтобы trust учитывал тон
   const trust = computeTrust({
     baseTrust: 20,
     evidences: evidences || [],
-    history: (history || []).filter(h => h.stage).map(h => ({ stage: h.stage })),
+    history: history || [],
     lastUserText: message || ''
   });
 
@@ -362,10 +399,13 @@ app.post('/api/score', (req, res) => {
       Array.isArray(b.evidences) ? b.evidences.map(String) :
       (Number.isFinite(b.evidence) ? Array.from({ length: Math.max(0, b.evidence|0) }, (_, i) => `proof_${i+1}`) :
       []);
+
     const history = Array.isArray(b.history) ? b.history : [];
     const lastUserText = history.filter(h => h.role === 'user').slice(-1)[0]?.content || '';
 
-    const trust = computeTrust({ baseTrust: 20, evidences, history: [], lastUserText });
+    // считаем trust с ПОЛНОЙ историей (тон)
+    const trust = computeTrust({ baseTrust: 20, evidences, history, lastUserText });
+
     const msgText = history.filter(h => h.role === 'user').map(h => h.content || '').join('\n');
 
     const good = [];
