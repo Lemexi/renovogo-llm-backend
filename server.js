@@ -29,7 +29,7 @@ app.use(cors({
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
 
-// ---------- PRICEBOOK (в контекст без «училок») ----------
+// ---------- PRICEBOOK (в системный контекст, не в ответ) ----------
 const PRICEBOOK = `
 [PRICEBOOK v1 — CZ/PL]
 — Czech Republic (per candidate):
@@ -54,7 +54,7 @@ const ChatSchema = z.object({
   })).optional()
 });
 
-// ---------- Small utils ----------
+// ---------- Utils ----------
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 const pick  = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const trimToSentences = (text, max = 6) => {
@@ -69,7 +69,21 @@ const extractFirstJsonObject = (s) => {
 const lastAssistantReplyFromHistory = (history=[]) =>
   String((history || []).filter(h => h.role==='assistant').slice(-1)[0]?.content || '').trim();
 
-// ---------- «живые» реплики по темам ----------
+// --- actions normalize ---
+const ACTION_WHITELIST = [
+  "invoice_request","ask_demands","ask_contract","ask_uradprace",
+  "ask_employer_contact","ask_price_breakdown","test_one_candidate","goodbye"
+];
+const ACTION_ORDER = new Map([
+  ["ask_demands",1],["ask_contract",2],["ask_uradprace",3],
+  ["ask_employer_contact",4],["ask_price_breakdown",5],
+  ["test_one_candidate",6],["invoice_request",7],["goodbye",8]
+]);
+const normalizeActions = (arr) =>
+  Array.from(
+    new Set((Array.isArray(arr)?arr:[]).filter(a => ACTION_WHITELIST.includes(a)))
+  ).sort((a,b)=> (ACTION_ORDER.get(a)||99)-(ACTION_ORDER.get(b)||99));
+
 const FALLBACK_HUMAN = [
   "Не понял вас. О чём речь?",
   "Секунду, вы что имеете в виду?",
@@ -153,8 +167,7 @@ const BANNED_PATTERNS = [
   /гарантирую.*виз/i,          // «гарантия визы»
   /связи.*посольств/i          // выдуманные связи
 ];
-
-// ---------- Помощники ----------
+// ---------- Сборка сообщений в LLM ----------
 function buildMessages({ history = [], message, trust, evidences }) {
   const sys = {
     role: 'system',
@@ -171,23 +184,23 @@ function buildMessages({ history = [], message, trust, evidences }) {
   return [sys, ...trimmed, { role: 'user', content: message }];
 }
 
-// «оживляем» ответ: тон, вопросы, анти-ранняя оплата, анти-повторы
+// ---------- «Оживление» и бортики ----------
 function humanize({ parsed, trust, evidences, history }) {
   let reply = String(parsed.reply || '').trim();
   const lastBot = lastAssistantReplyFromHistory(history);
   const uniqEvidenceCount = new Set(evidences || []).size;
   const gatesOk = (trust >= 90 && uniqEvidenceCount >= 2);
 
-  // Запрещённые фразы → мягкий перехват к документам
+  // Запрещённые фразы → перехват в документы
   if (!reply || BANNED_PATTERNS.some(rx => rx.test(reply))) {
     reply = pick(ASK_DOCS_HUMAN);
-    parsed.stage = parsed.stage === 'Payment' ? 'Contract' : (parsed.stage || 'Greeting');
+    parsed.stage = parsed.stage === 'Payment' ? 'Contract' : (parsed.stage || 'Demand');
     parsed.needEvidence = true;
     parsed.suggestedActions = ["ask_demands","ask_contract","ask_uradprace"];
     parsed.confidence = Math.min(parsed.confidence ?? trust, 70);
   }
 
-  // Если модель «уходит» в оплату до ворот — жёсткий живой щелчок
+  // Ранняя оплата до «ворот» → жёсткий человечный щелчок
   if (!gatesOk && parsed.stage === 'Payment') {
     reply = pick(TOO_EARLY_PAY_HUMAN);
     parsed.stage = 'Contract';
@@ -198,33 +211,21 @@ function humanize({ parsed, trust, evidences, history }) {
     parsed.confidence = Math.min(parsed.confidence ?? trust, 80);
   }
 
-  // Поддержка «тем»: если в истории скоро после приветствия — прокидываем неудобные вопросы
+  // Тематические подталкивания по последнему сообщению пользователя
   const userText = (history || []).filter(h=>h.role==='user').slice(-1)[0]?.content || '';
-  if (/слот|запис|посольств/i.test(userText)) {
-    reply = reply || pick(SLOT_QUESTIONS);
-  }
-  if (/крипт|crypto|usdt|btc/i.test(userText)) {
-    reply = reply || pick(CRYPTO_SKEPTIC);
-  }
-  if (/hr|эйчар|кадр|отдел кадров|контакт/i.test(userText)) {
-    reply = reply || pick(HR_CONTACT);
-  }
-  if (/сколько|цена|дорог|ценник|стоим/i.test(userText)) {
-    reply = reply || pick(BARGAIN);
-  }
-  if (/uradprace|у?радпрац/i.test(userText)) {
-    reply = reply || pick(URADPRACE_PUSH);
-  }
-  if (/кандидат|people|workers|людей/i.test(userText)) {
-    reply = reply || pick(CANDIDATE_TEST);
-  }
+  if (/слот|запис|посольств/i.test(userText))  reply ||= pick(SLOT_QUESTIONS);
+  if (/крипт|crypto|usdt|btc/i.test(userText)) reply ||= pick(CRYPTO_SKEPTIC);
+  if (/hr|эйчар|кадр|отдел кадров|контакт/i.test(userText)) reply ||= pick(HR_CONTACT);
+  if (/сколько|цена|дорог|ценник|стоим/i.test(userText))     reply ||= pick(BARGAIN);
+  if (/uradprace|у?радпрац/i.test(userText))                 reply ||= pick(URADPRACE_PUSH);
+  if (/кандидат|people|workers|людей/i.test(userText))       reply ||= pick(CANDIDATE_TEST);
 
   // Ворота пройдены → короткое «финализируем»
   if (gatesOk && parsed.stage !== 'Payment') {
     const set = new Set(parsed.suggestedActions || []);
     set.add('invoice_request');
     parsed.suggestedActions = Array.from(set);
-    reply = reply || pick(CLOSING_READY);
+    reply ||= pick(CLOSING_READY);
     parsed.stage = 'Payment';
     parsed.needEvidence = false;
     parsed.confidence = Math.max(parsed.confidence ?? 0, trust);
@@ -237,10 +238,17 @@ function humanize({ parsed, trust, evidences, history }) {
 
   parsed.reply = trimToSentences(reply, 6);
   if (!parsed.reply) parsed.reply = pick(FALLBACK_HUMAN);
+  parsed.suggestedActions = normalizeActions(parsed.suggestedActions);
+
+  // Если мы просим документы, логично держать stage не ниже Demand
+  if (!gatesOk && /Demand|контракт|uradprace/i.test(parsed.reply) && parsed.stage === 'Greeting') {
+    parsed.stage = 'Demand';
+  }
 
   return parsed;
 }
 
+// ---------- Вызов LLM ----------
 async function runLLM({ history, message, evidences, stage }) {
   const trust = computeTrust({
     baseTrust: 20,
@@ -258,7 +266,7 @@ async function runLLM({ history, message, evidences, stage }) {
     frequency_penalty: 0.3,
     presence_penalty: 0.0,
     max_tokens: 380,
-    response_format: { type: 'json_object' },
+    response_format: { type: 'json_object' }, // жёсткий JSON
     messages
   });
 
@@ -362,7 +370,7 @@ app.post('/api/reply', async (req, res) => {
         trust,
         evidenceCount,
         stage: result.stage,
-        actions: result.suggestedActions
+        actions: normalizeActions(result.suggestedActions)
       }
     });
   } catch (e) {
@@ -371,7 +379,7 @@ app.post('/api/reply', async (req, res) => {
   }
 });
 
-// /api/score — подсказки менеджеру (лёгкая эвристика)
+// /api/score — подсказки менеджеру (простая эвристика)
 app.post('/api/score', (req, res) => {
   try {
     const b = req.body || {};
