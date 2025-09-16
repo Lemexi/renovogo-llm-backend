@@ -1,5 +1,5 @@
-// server.js — RenovoGo LLM backend (stable memory, anti-dup ACKs, realistic flow)
-// v2025-09-16-6 (fix: count only NEW evidences per request)
+// server.js — RenovoGo LLM backend (stable memory, no robotic ACKs, realistic flow)
+// v2025-09-16-7
 
 import 'dotenv/config';
 import express from 'express';
@@ -110,21 +110,34 @@ function forceMasculine(text){
 function splitSentences(t=''){
   return String(t).split(/(?<=[.!?])\s+/).filter(s => s.trim());
 }
-function dedupeSentences(t=''){
-  const seen = new Set();
-  const out = [];
-  for (const s of splitSentences(t)) {
-    const key = s.trim().toLowerCase();
-    if (!seen.has(key)) { seen.add(key); out.push(s.trim()); }
+function joinUniqueSentences(chunks=[]){
+  const seen = new Set(); const out = [];
+  for (const s of chunks.flatMap(splitSentences)) {
+    const k = s.trim().toLowerCase();
+    if (k && !seen.has(k)) { seen.add(k); out.push(s.trim()); }
   }
   return out.join(' ');
 }
 function stripRequisitesFromDemand(t=''){
-  // вычищаем любые предложения вида «реквизит… из Demand»
+  // убираем любые фразы «реквизиты из Demand»
   return String(t)
     .replace(/[^.?!]*реквизит[^.?!]*(из\s+)?demand[^.?!]*[.?!]/gi, '')
     .replace(/\s{2,}/g,' ')
     .trim();
+}
+// убираем запросы «реквизиты работодателя/емployer requisites»
+function stripEmployerRequisitesRequests(t=''){
+  return String(t).replace(
+    /[^.?!]*(реквизит\w*|requisite\w*)[^.?!]*(работодател\w*|employer)[^.?!]*[.?!]/gi,
+    ''
+  );
+}
+// убираем «роботские» ACK’и типа «спасибо/получил визитку/деманд/контракт/видео»
+function stripRoboticAcks(t=''){
+  const KEY = '(demand|деманд|business\\s*card|визитк|контракт|соглашен|sample|презентац|video|видео|виза|pdf)';
+  const r1 = new RegExp(`[^.?!]*\\b(спасибо|получил|получена|получено|принял|received|got)\\b[^.?!]*${KEY}[^.?!]*[.?!]`,'gi');
+  const r2 = new RegExp(`[^.?!]*${KEY}[^.?!]*\\b(получил|получена|получено|принял|received|got)\\b[^.?!]*[.?!]`,'gi');
+  return String(t).replace(r1,'').replace(r2,'').replace(/\s{2,}/g,' ').trim();
 }
 function cleanSales(t=''){
   return String(t).replace(/(?:оставьте заявку.*?|мы предлагаем широкий спектр услуг)/gi, '').trim();
@@ -214,9 +227,9 @@ function buildMessages({ history = [], message, trust, evidences, evidenceDetail
       `— trust=${trust}; evidences=${JSON.stringify(evidences || [])}\n` +
       `— evidence_details=${JSON.stringify(evidenceDetails || {})}\n` +
       PRICEBOOK + `\n` +
-      `Правила: Demand Letter — это запрос без реквизитов работодателя; ` +
-      `никогда не проси "реквизиты из Demand". Реквизиты — только в контракте о сотрудничестве/инвойсе.\n` +
-      `Отвечай СТРОГО одним JSON-объектом (см. формат). Будь кратким (до ${MAX_SENTENCES} предложений).`
+      `Правила: Demand Letter — это запрос/описание вакансии (без реквизитов работодателя). ` +
+      `Реквизиты и стоимость — только в контракте о сотрудничестве/инвойсе. ` +
+      `Отвечай СТРОГО одним JSON-объектом. Будь кратким (до ${MAX_SENTENCES} предложений).`
   };
   const trimmed = (history||[]).slice(-12).map(h => ({
     role: h.role, content: h.content
@@ -241,13 +254,13 @@ async function createChatWithRetry(payload, tries = 2) {
 function postRules({ parsed, trust, evidences, history, userText, sid, evidenceDetails }) {
   const S = getState(sid);
 
-  // Новые пруфы ТОЛЬКО в этом запросе (исключаем то, что уже хранится в сессии)
+  // Новые пруфы ТОЛЬКО в этом запросе
   const inc = new Set((evidences || []).filter(k => !S.seenEvidences.has(k)));
 
   let reply = String(parsed.reply || '').trim();
   const setActions = new Set(parsed.suggestedActions || []);
 
-  // Быстрые точные ответы
+  // Быстрый ответ «кто ты?»
   if (/(как.*зовут|вас зовут|ваше имя|who are you)/i.test(userText)) {
     reply = 'Меня зовут Али.';
     parsed.stage ??= 'Greeting';
@@ -288,90 +301,47 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     setActions.add('ask_demands'); setActions.add('ask_coop_contract'); setActions.add('ask_price_breakdown');
   }
 
-  // ACK’и — только для НОВЫХ материалов (или для визитки при новых деталях)
-  const acks = [];
-
-  // Визитка: новая или обновлённые details
+  // ====== Тихая фиксация приходящих материалов (без роботских «получил») ======
+  // Визитка — тихо сохраняем, ничего не говорим
   if (inc.has('business_card') || (evidenceDetails && evidenceDetails.business_card)) {
-    const n = bumpEvidence(sid, 'business_card', evidenceDetails?.business_card);
-    if (n === 1) acks.push('Визитку менеджера получил.');
-    else if (n === 2) acks.push('Вы уже отправляли визитку, данные сохранил.');
-    else if (n >= 3) acks.push('Хватит дублировать визитку — всё сохранено.');
+    bumpEvidence(sid, 'business_card', evidenceDetails?.business_card);
   }
-
-  // Demand Letter — только если новый
+  // Demand Letter — тихо учитываем. Если ещё нет coop-контракта — мягко направляем на него
   if (inc.has('demand_letter')) {
-    const n = bumpEvidence(sid, 'demand_letter');
-    if (n === 1) {
-      acks.push('Demand Letter получил.');
-      if (!hasEvidence(sid,'coop_contract_pdf')) {
-        parsed.stage = 'Contract'; parsed.needEvidence = true; setActions.add('ask_coop_contract');
-      }
-    } else if (n === 2) {
-      acks.push('Вы уже отправляли Demand Letter — помню детали вакансии, двигаюсь дальше.');
-    } else if (n >= 3) {
-      acks.push('Зачем снова отправляете один и тот же Demand Letter? Давайте работать по списку.');
+    bumpEvidence(sid, 'demand_letter');
+    if (!hasEvidence(sid,'coop_contract_pdf')) {
+      setActions.add('ask_coop_contract');
+      parsed.stage = 'Contract';
+      parsed.needEvidence = true;
+      // добавим короткую направляющую фразу, НО без «получил/спасибо»
+      reply = joinUniqueSentences([reply, 'Для проверки нужен полный контракт о сотрудничестве.']);
     }
   }
-
-  // Пример контракта — только если новый
+  // Пример контракта — тихо учитываем; просим полный контракт
   if (inc.has('sample_contract_pdf')) {
-    const n = bumpEvidence(sid, 'sample_contract_pdf');
-    if (n === 1) {
-      acks.push('Пример контракта получен. Для проверки нужен полный контракт о сотрудничестве.');
-      parsed.stage = 'Contract'; parsed.needEvidence = true; setActions.add('ask_coop_contract');
-    } else if (n === 2) {
-      acks.push('Пример контракта уже получал — жду полный контракт о сотрудничестве.');
-    } else if (n >= 3) {
-      acks.push('Хватает примеров. Пришлите уже полный контракт о сотрудничестве.');
+    bumpEvidence(sid, 'sample_contract_pdf');
+    if (!hasEvidence(sid,'coop_contract_pdf')) {
+      setActions.add('ask_coop_contract');
+      parsed.stage = 'Contract';
+      parsed.needEvidence = true;
+      reply = joinUniqueSentences([reply, 'Для финальной проверки нужен полный контракт о сотрудничестве.']);
     }
   }
-
-  // Полный контракт — только если новый
+  // Полный контракт — тихо учитываем; направляем к цене/инвойсу
   if (inc.has('coop_contract_pdf')) {
-    const n = bumpEvidence(sid, 'coop_contract_pdf');
-    if (n === 1) {
-      acks.push('Контракт о сотрудничестве получен.');
-      parsed.stage = 'Contract'; parsed.needEvidence = false; setActions.add('ask_price_breakdown');
-    } else if (n === 2) {
-      acks.push('Контракт уже на руках — условия и реквизиты вижу.');
-    } else if (n >= 3) {
-      acks.push('Контракт дублировать не нужно, работаю с последней версией.');
-    }
+    bumpEvidence(sid, 'coop_contract_pdf');
+    parsed.stage = 'Contract';
+    parsed.needEvidence = false;
+    setActions.add('ask_price_breakdown');
+    // без слова «получен» — просто двигаемся дальше
+    reply = joinUniqueSentences([reply, 'Контракт вижу. Могу перейти к разбивке цены и инвойсу.']);
   }
-
-  // Прочие материалы — только новые
+  // Прочие материалы — тихо учитываем, ничего не озвучиваем
   for (const key of ['visa_sample','presentation','video','website','company_registry','reviews','registry_proof','price_breakdown','slot_plan','invoice_template','nda']) {
-    if (inc.has(key)) {
-      const n = bumpEvidence(sid, key, evidenceDetails?.[key]);
-      if (n === 1) {
-        const label = ({
-          visa_sample:'Пример визы получен.',
-          presentation:'Презентация получена.',
-          video:'Видео получено.',
-          website:'Сайт записал.',
-          company_registry:'Выписка из реестра получена.',
-          reviews:'Отзывы учёл.',
-          registry_proof:'Подтверждение регистрации получено.',
-          price_breakdown:'Разбивку цены учёл.',
-          slot_plan:'План по слотам учёл.',
-          invoice_template:'Шаблон инвойса учёл.',
-          nda:'NDA получил.'
-        })[key] || 'Материал получен.';
-        acks.push(label);
-      } else if (n === 2) {
-        acks.push('Материал уже получал — повтор не обязателен.');
-      } else if (n >= 3) {
-        acks.push('Дублировать один и тот же файл не нужно.');
-      }
-    }
+    if (inc.has(key)) bumpEvidence(sid, key, evidenceDetails?.[key]);
   }
 
-  if (acks.length) {
-    reply = conciseJoin([limitSentences(reply, MAX_SENTENCES), acks.join(' ')]);
-  }
-
-  // Способ оплаты — только банк
+  // ====== Политика оплаты — только банк ======
   if (/(банк|банковск|crypto|крипто|usdt|btc|eth|криптовалют)/i.test(userText) && /оплат|плат[её]ж|инвойс|сч[её]т/i.test(userText)) {
     reply = 'Банковский инвойс. Криптовалюту не принимаем.';
     setActions.add('invoice_request');
@@ -379,12 +349,13 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     parsed.needEvidence = false;
   }
 
-  // Санитария текста
-  reply = stripRequisitesFromDemand(reply);
-  reply = dedupeSentences(reply);
+  // ====== Санитария текста (убираем лишнее и «робота») ======
+  reply = stripEmployerRequisitesRequests(reply); // не просим «реквизиты работодателя»
+  reply = stripRequisitesFromDemand(reply);       // не просим «реквизиты из Demand»
+  reply = stripRoboticAcks(reply);                // убираем «спасибо/получил X»
   reply = cleanSales(reply);
-  reply = limitSentences(reply, MAX_SENTENCES);
   reply = forceMasculine(reply);
+  reply = limitSentences(reply, MAX_SENTENCES);
 
   // Анти-луп
   if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) {
@@ -394,7 +365,7 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   }
   S.lastReply = reply;
 
-  // Ворота финализации — требуем контракт + ≥2 уникальных пруфа + trust≥90
+  // Финальные ворота — контракт + ≥2 уникальных пруфа + trust≥90
   const uniqEvidenceCount = evidenceCountUnique(sid);
   const hasCoop = hasEvidence(sid,'coop_contract_pdf');
   const gatesOk = (trust >= 90 && uniqEvidenceCount >= 2 && hasCoop);
