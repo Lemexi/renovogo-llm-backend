@@ -1,22 +1,22 @@
 // trust.js
 // Доверие Али: правило-ориентированный скоринг с «человечной» кривой.
-// Совместимо с server.js v2025-09-16-2 (ключи evidences уже нормализованы).
+// Совместимо с server.js v2025-09-16-5 (ключи evidences уже нормализованы).
 
 // ==== Категории доказательств (нормализованные ключи) ====
-// HARD: документы, на основании которых реально можно работать.
+// HARD: документы-основания для работы.
 const HARD_PROOFS = new Set([
-  'demand_letter',      // официальный деманд/запрос
-  'coop_contract_pdf',  // ПОЛНЫЙ контракт о сотрудничестве (подпись/печать)
-  'contract_pdf'        // алиас, если прилетит со старого фронта
+  'demand_letter',      // официальный деманд/запрос (без реквизитов)
+  'coop_contract_pdf',  // ПОЛНЫЙ контракт о сотрудничестве (подпись/печать, реквизиты)
+  'contract_pdf'        // алиас со старого фронта (тоже трактуем как полный)
 ]);
 
-// MEDIUM: проверяемые, но вторичные признаки.
+// MEDIUM: проверяемые вторичные признаки.
 const MEDIUM_PROOFS = new Set([
   'website',            // сайт
-  'company_registry',   // выписка из реестра компаний (если прилетит таким ключом)
-  'registry_proof',     // подтверждение регистрации/уряд праце и т.п.
+  'company_registry',   // выписка из реестра компаний
+  'registry_proof',     // подтверждение регистрации/уряд праце
   'visa_sample',        // пример визы/штампа (деперсон.)
-  'reviews'             // отзывы (если есть регулярный ключ)
+  'reviews'             // отзывы
 ]);
 
 // SUPPORT: вспомогательные материалы.
@@ -26,21 +26,21 @@ const SUPPORT_PROOFS = new Set([
   'slot_plan',          // план по слотам
   'nda',
   'invoice_template',
-  'business_card',
+  'business_card',      // визитка менеджера
   'presentation',
   'video'
 ]);
 
-// Подсчёт типов пруфов
+// Подсчёт типов пруфов (учитываем уникальные ключи)
 function countKinds(evidences = []) {
-  const uniq = new Set((evidences || []).map(e => String(e).trim().toLowerCase()));
+  const uniqSet = new Set((evidences || []).map(e => String(e).trim().toLowerCase()));
   let hard = 0, med = 0, sup = 0;
-  for (const e of uniq) {
+  for (const e of uniqSet) {
     if (HARD_PROOFS.has(e)) hard++;
     else if (MEDIUM_PROOFS.has(e)) med++;
     else if (SUPPORT_PROOFS.has(e)) sup++;
   }
-  return { uniq: uniq.size, hard, med, sup };
+  return { uniq: uniqSet.size, hard, med, sup, uniqSet };
 }
 
 // ==== Анализ тона и сигналов ====
@@ -62,7 +62,7 @@ function pressureScore(text='') {
   return sc;
 }
 
-// Нереалистично быстрые сроки для документов/визы (<=5 рабочих дней)
+// Нереалистично быстрые сроки для доков/визы (<=5 рабочих дней)
 function unrealisticTimeline(text='') {
   const t = String(text).toLowerCase();
   const talksDocs = /(документ|контракт|офер|виза|слот|приглашени|регистрац)/.test(t);
@@ -70,7 +70,7 @@ function unrealisticTimeline(text='') {
   return talksDocs && fast;
 }
 
-// Сводный тон последних сообщений истории
+// Сводный тон по последним репликам
 function toneFromHistory(history=[]) {
   const lastMsgs = (history || []).slice(-6);
   let polite = 0, press = 0, obseq = 0;
@@ -88,7 +88,7 @@ function toneFromHistory(history=[]) {
   return { polite, press, obseq };
 }
 
-// Сигналы из последней фразы пользователя
+// Сигналы/красные флаги из последней фразы пользователя
 function textSignals(text = '') {
   const t = (text || '').toLowerCase();
 
@@ -103,7 +103,13 @@ function textSignals(text = '') {
   if (/связи в посольстве|решаем через знакомых/.test(t)) red.push('embassy_connections_claim');
   if (unrealisticTimeline(t)) red.push('unrealistic_timeline');
 
-  // GREEN HINTS (мягкие)
+  // НОВОЕ: путаница «€350 = зарплата» (это сервисный платёж)
+  if (/(зарплат|salary)/.test(t) && /(€\s*350|350\s*€|\b350\b)/.test(t)) red.push('fee_salary_confusion');
+
+  // НОВОЕ: «реквизиты из Demand» — концептуальная ошибка
+  if (/реквизит/.test(t) && /demand/.test(t)) red.push('requisites_from_demand');
+
+  // GREEN HINTS (мягкие позитивные сигналы)
   if (/сч[её]т|инвойс|банковск/.test(t)) green.push('mentions_bank_payment');
   if (/сайт|website|https?:\/\//.test(t)) green.push('mentions_website');
   if (/деманд|demand/.test(t)) green.push('mentions_demand');
@@ -118,20 +124,24 @@ function textSignals(text = '') {
 
 // ==== Основной расчёт ====
 export function computeTrust({ baseTrust = 20, evidences = [], history = [], lastUserText = '' }) {
-  // База
   let score = Math.max(0, Math.min(100, baseTrust));
 
-  // Документальные признаки
-  const { uniq, hard, med, sup } = countKinds(evidences);
+  // Документальные признаки — считаем по уникальным ключам
+  const { uniq, hard, med, sup, uniqSet } = countKinds(evidences);
+
+  // Бонус за наличие ПОЛНОГО контракта (ключ ко входу в финализацию)
+  const hasCoop = uniqSet.has('coop_contract_pdf') || uniqSet.has('contract_pdf');
+
   score += hard * 18;                 // каждый тяжёлый — сильный прирост
-  score += Math.min(2, med) * 8;      // максимум 16 за медиум
-  score += Math.min(2, sup) * 3;      // максимум 6 за саппорт
+  score += Math.min(2, med) * 8;      // максимум +16 за медиум
+  score += Math.min(2, sup) * 3;      // максимум +6 за саппорт
+  if (hasCoop) score += 6;            // доп. доверие за полный контракт
 
   // Разнообразие типов
   if (uniq >= 3) score += 6;
   if (uniq >= 5) score += 6;
 
-  // Стадийные мягкие бонусы (если есть что-то реальное)
+  // Стадийные мягкие бонусы (только если есть реальные доки)
   const stages = (history || []).map(h => (h.stage || '').toLowerCase());
   const sawContractStage  = stages.includes('contract');
   const sawCandidateStage = stages.includes('candidate');
@@ -154,6 +164,8 @@ export function computeTrust({ baseTrust = 20, evidences = [], history = [], las
     else if (r === 'pressure')                  score -= 18;
     else if (r === 'embassy_connections_claim') score -= 30;
     else if (r === 'unrealistic_timeline')      score -= 12;
+    else if (r === 'fee_salary_confusion')      score -= 12; // «€350 = зарплата» — нет
+    else if (r === 'requisites_from_demand')    score -= 10; // Demand ≠ реквизиты
   }
   if (sig.green.includes('mentions_bank_payment')) score += 3;
   if (sig.green.includes('mentions_website'))      score += 2;
@@ -161,15 +173,15 @@ export function computeTrust({ baseTrust = 20, evidences = [], history = [], las
   if (sig.green.includes('mentions_contract'))     score += 3;
   if (sig.green.includes('test_one_candidate'))    score += 3;
 
-  // Нелинейные ворота (чтобы нельзя было «накрутить» мелочами)
+  // Нелинейные ворота (защита от «накрутки» мелочами)
   // Gate 1: >50 требует минимум 1 тяжёлый пруф
   if (score > 50 && hard < 1) score = 50;
 
-  // Gate 2: >80 требует (2 тяжёлых) ИЛИ (1 тяжёлый + 1 средний)
+  // Gate 2: >80 требует (2×HARD) ИЛИ (1×HARD + 1×MEDIUM)
   const passGate2 = (hard >= 2) || (hard >= 1 && med >= 1);
   if (score > 80 && !passGate2) score = 80;
 
-  // Gate 3: >90 требует 2 тяжёлых и отсутствие красных флагов
+  // Gate 3: >90 требует 2×HARD и отсутствие красных флагов
   if (score > 90 && (hard < 2 || sig.red.length > 0)) score = 90;
 
   // Наказание за ранний «Payment», если ворота не пройдены
