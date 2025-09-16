@@ -132,6 +132,64 @@ function stripEmployerRequisitesRequests(t=''){
     ''
   );
 }
+// === Greeting helpers ===
+function extractUserName({ history = [], evidenceDetails = {} } = {}) {
+  // 1) из визитки
+  const cardName = evidenceDetails?.business_card?.name;
+  if (cardName && String(cardName).trim()) return String(cardName).trim();
+
+  // 2) из последних реплик пользователя: "Я Виктор", "Это Виктор", подпись и т.п.
+  const lastUser = [...(history||[])].reverse().find(h => h.role === 'user');
+  const txt = (lastUser?.content || '').trim();
+  // очень мягкий хак: ищем слово с заглавной буквы рядом с "я"/"меня зовут"/подпись
+  const m = txt.match(/(?:я|меня\s+зовут|это)\s+([A-ZА-ЯЁ][a-zа-яё\-\']{1,30})/i);
+  if (m) return m[1];
+
+  return '';
+}
+
+function rewriteVacancyQuestionToSupplierRole(text=''){
+  // Переводим «какие вакансии вы ищете?» → «какие вакансии у вас доступны?»
+  let t = String(text);
+
+  // Грубая замена частых форм
+  t = t.replace(/какие\s+вакансии[^.?!]*ищете[^.?!]*[.?!]?/gi, 'Какие вакансии у вас доступны?');
+
+  // Убираем лишние самопрезентации вида «Мы работаем с Чехией и Польшей уже давно»
+  t = t.replace(/мы\s+работаем[^.?!]*чех(и|и|ии)й[^.?!]*польш[^.?!]*уже\s+давно[^.?!]*[.?!]?/gi, '');
+
+  // Слегка чистим двойные пробелы/точки
+  t = t.replace(/\s{2,}/g, ' ').replace(/\s+([?.!])/g, '$1').trim();
+
+  return t;
+}
+
+function craftHumanGreeting({ base='', name='' } = {}){
+  // Короткие варианты; без «спасибо за визитку», без «мы давно работаем»
+  const variants = name
+    ? [
+        `Привет, ${name}. Чем могу помочь?`,
+        `${name}, рад знакомству. С какими задачами ко мне пришли?`,
+        `${name}, мне тоже приятно. Какие вакансии у вас сейчас открыты?`
+      ]
+    : [
+        'Привет! Чем могу помочь?',
+        'Рад знакомству. Какие вакансии у вас сейчас открыты?',
+        'Здравствуйте. С чего начнём: какие вакансии у вас доступны?'
+      ];
+
+  // Если LLM уже что-то сказал — аккуратно подменяем только вопросную часть
+  let t = rewriteVacancyQuestionToSupplierRole(base);
+  if (!t || t.length < 3) {
+    t = variants[Math.floor(Math.random()*variants.length)];
+  } else {
+    // если не осталось вопроса — доклеим корректный
+    if (!/[?]$/.test(t) && !/ваканси/i.test(t)) {
+      t = `${t} Какие вакансии у вас доступны?`;
+    }
+  }
+  return forceMasculine(t);
+}
 // убираем «роботские» ACK’и типа «спасибо/получил визитку/деманд/контракт/видео»
 function stripRoboticAcks(t=''){
   const KEY = '(demand|деманд|business\\s*card|визитк|контракт|соглашен|sample|презентац|video|видео|виза|pdf)';
@@ -184,7 +242,7 @@ const normalizeActions = (arr) =>
 const REG_LONGTERM_MONTHS = 6;
 const REG_SEASONAL_MONTHS = 3;
 function registrationAnswer(){
-  return `По долгосрочному — ${REG_LONGTERM_MONTHS} мес назад; по сезонному — ${REG_SEASONAL_MONTHСS || REG_SEASONAL_MONTHS} мес назад. Очереди нестабильные. Сначала проверю Demand Letter и контракт.`;
+  return `По долгосрочному — ${REG_LONGTERM_MONTHS} мес назад; по сезонному — ${REG_SEASONAL_MONTHS} мес назад. Очереди нестабильные.`;
 }
 
 // ---------- Микро-состояние сессии ----------
@@ -339,7 +397,7 @@ function chooseObjection({ sid, userText='', trust=0, uniqEvidence=0, hasDemand=
   } else if (!hasCoop) {
     nudge = 'Нужен полный контракт о сотрудничестве — проверю условия и вернусь по оплате.';
   } else if (uniqEvidence < 2) {
-    nudge = 'Добавьте ещё один пруф (например, сайт/реестр) — так двинемся быстрее.';
+    nudge = 'У меня нет сейчас своюодных кандидатов для Вас';
   } else {
     nudge = 'Начнём с одного кандидата и параллельно согласуем инвойс по этапам.';
   }
@@ -381,11 +439,23 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     parsed.suggestedActions = ['ask_demands','ask_coop_contract'];
   }
 
+  // --- Greeting rewrite: продавец кандидатов, а не соискатель ---
+  // Если это первое касание/приветствие, исправляем формулировку под «Какие вакансии у вас доступны?»
+  const isEarly = (history || []).length <= 2 || (!parsed.stage || parsed.stage === 'Greeting');
+  if (isEarly) {
+    const userName = extractUserName({ history, evidenceDetails });
+    reply = craftHumanGreeting({ base: reply, name: userName });
+    parsed.stage = 'Greeting';
+  } else {
+    // Даже позже — выправляем ошибочную роль, если «какие вакансии вы ищете»
+    reply = rewriteVacancyQuestionToSupplierRole(reply);
+  }
+
   // Вопрос про кол-во кандидатов
   const askCandidates = /(сколько.*кандидат|кандидат(ов)?\s*(есть|готов|подад)|сколько человек будем подавать)/i.test(userText);
   if (askCandidates) {
     if (hasEvidence(sid,'demand_letter') && hasEvidence(sid,'coop_contract_pdf')) {
-      reply = 'Готов подать 1–2 кандидата на старт в Чехию. Остальные — после финализации и слотов.';
+      reply = 'Готов подать 1–2 кандидата на старт в Чехию. Остальные — после регестрации и в посольвто.';
       parsed.stage = parsed.stage === 'Payment' ? 'Payment' : 'Candidate';
       parsed.needEvidence = false;
       setActions.add('invoice_request');
@@ -410,7 +480,7 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
       setActions.add('ask_coop_contract');
       parsed.stage = 'Contract';
       parsed.needEvidence = true;
-      reply = joinUniqueSentences([reply, 'Для проверки нужен полный контракт о сотрудничестве.']);
+      reply = joinUniqueSentences([reply, 'Я расмотрел ваш запрос, не знаю смогу ли я подобрать вам персонал, это тяжолое направления, не возможно получить назначения сейчас в Индии.']);
     }
   }
   if (inc.has('sample_contract_pdf')) {
@@ -419,7 +489,7 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
       setActions.add('ask_coop_contract');
       parsed.stage = 'Contract';
       parsed.needEvidence = true;
-      reply = joinUniqueSentences([reply, 'Для финальной проверки нужен полный контракт о сотрудничестве.']);
+      reply = joinUniqueSentences([reply, 'Отправте мне пожалуйста договор B2B']);
     }
   }
   if (inc.has('coop_contract_pdf')) {
@@ -427,7 +497,7 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     parsed.stage = 'Contract';
     parsed.needEvidence = false;
     setActions.add('ask_price_breakdown');
-    reply = joinUniqueSentences([reply, 'Контракт вижу. Могу перейти к разбивке цены и инвойсу.']);
+    reply = joinUniqueSentences([reply, 'Контракт вижу. Могу перейти к оплате.']);
   }
   for (const key of ['visa_sample','presentation','video','website','company_registry','reviews','registry_proof','price_breakdown','slot_plan','invoice_template','nda']) {
     if (inc.has(key)) bumpEvidence(sid, key, evidenceDetails?.[key]);
@@ -473,7 +543,7 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
 
   // Анти-луп
   if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) {
-    reply = 'Предлагаю стартовать с одного кандидата. Документы проверю и вернусь по инвойсу.';
+    reply = 'Предлагаю стартовать с одного кандидата. Документы проверю и вернусь с оплатой.';
     parsed.stage = hasCoop ? 'Payment' : 'Contract';
     if (!hasCoop) { setActions.add('ask_coop_contract'); parsed.needEvidence = true; }
     setActions.add('test_one_candidate');
@@ -487,7 +557,7 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   if (gatesOk) {
     setActions.add('invoice_request');
     if (!/инвойс|сч[её]т|реквизит/i.test(reply)) {
-      reply = conciseJoin([reply, 'Готов перейти к финализации — пришлите реквизиты для инвойса.']);
+      reply = conciseJoin([reply, 'Готов перейти к финализации — пришлите реквизиты для оплаты.']);
     }
     parsed.stage = 'Payment';
     parsed.needEvidence = false;
