@@ -5,7 +5,6 @@ import 'dotenv/config';
 import express from 'express';
 import morgan from 'morgan';
 import cors from 'cors';
-import rateLimit from 'express-rate-limit';
 import { Groq } from 'groq-sdk';
 import { z } from 'zod';
 import { SYSTEM_PROMPT } from './prompt.js';
@@ -28,20 +27,30 @@ app.use(cors({
   credentials: false
 }));
 
-// ---------- Rate limit ----------
-const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 40,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-app.use('/api/', limiter);
+// ---------- Mini Rate Limit (без внешних пакетов) ----------
+const rlStore = new Map(); // ip -> { count, reset }
+function miniRateLimit(req, res, next){
+  if (!req.path.startsWith('/api/')) return next();
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+  const now = Date.now();
+  const rec = rlStore.get(ip) || { count: 0, reset: now + 60_000 };
+  if (now > rec.reset) { rec.count = 0; rec.reset = now + 60_000; }
+  rec.count += 1;
+  rlStore.set(ip, rec);
+  if (rec.count > 40) {
+    res.set('Retry-After', Math.ceil((rec.reset - now)/1000));
+    return res.status(429).json({ ok:false, error:'Too many requests, try again later.' });
+  }
+  next();
+}
+app.use(miniRateLimit);
 
 // ---------- Groq ----------
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
-const TEMPERATURE = Number(process.env.TEMPERATURE ?? 0.2); // ниже: меньше «воды»
+const TEMPERATURE = Number(process.env.TEMPERATURE ?? 0.2);
 const REPLY_MAX_TOKENS = Number(process.env.REPLY_MAX_TOKENS ?? 320);
+const MAX_SENTENCES = Number(process.env.MAX_SENTENCES ?? 4);
 
 // ---------- PRICEBOOK (в системный контекст, не в ответ) ----------
 const PRICEBOOK = `
@@ -103,7 +112,6 @@ function stripPromo(text){
   return t.replace(/\s{2,}/g,' ');
 }
 function forceMasculine(text){
-  // авто-правка «рада» -> «рад», «готова» -> «готов», т.п.
   return String(text||'')
     .replace(/\bрада\b/gi, 'рад')
     .replace(/\bготова\b/gi, 'готов')
@@ -147,7 +155,7 @@ function buildMessages({ history = [], message, trust, evidences }) {
     content:
       SYSTEM_PROMPT +
       `\n\n[Контекст]\ntrust=${trust}; evidences=${JSON.stringify(evidences || [])}\n${PRICEBOOK}\n` +
-      `Отвечай СТРОГО одним JSON-объектом (см. формат). Будь кратким (до 4 предложений).`
+      `Отвечай СТРОГО одним JSON-объектом (см. формат). Будь кратким (до ${MAX_SENTENCES} предложений).`
   };
   const trimmed = (history||[]).slice(-12).map(h => ({
     role: h.role, content: h.content
@@ -173,24 +181,17 @@ function postRules({ parsed, trust, evidences, history, userText, sid }) {
   const S = getState(sid);
   let reply = String(parsed.reply || '').trim();
 
-  // 0) Жёсткие, сценарные короткие ответы на частые вопросы
-  const q = userText.toLowerCase();
-
-  // — «Как вас зовут?»
+  // Жёсткие быстрые ответы на частые вопросы
   if (/(как.*зовут|вас зовут|ваше имя|who are you)/i.test(userText)) {
     reply = 'Меня зовут Али.';
     parsed.stage ??= 'Greeting';
   }
-
-  // — «Слоты/регистрация в посольстве/Дубаи/Чехия/Польша»
   if (/(слот|регистрац|посольств|консульт).*(дуба|dubai|чех|czech|pol|польш)/i.test(userText)) {
-    reply = 'По CZ/PL сейчас со слотами действительно сложно, в том числе в Дубае. Регистрация возможна только после проверки пакета документов и контракта.';
+    reply = 'По CZ/PL сейчас со слотами действительно сложно, в том числе в Дубае. Регистрация возможна после проверки пакета документов и контракта.';
     parsed.stage = 'Demand';
     parsed.needEvidence = true;
     parsed.suggestedActions = ['ask_demands','ask_contract'];
   }
-
-  // — «Когда последний раз регистрировали?»
   if (/(когда|последн).*(регистрир|записыва)/i.test(userText)) {
     reply = 'Регистрации бывают, но очереди нестабильные. Сначала проверю ваш пакет (Demand/контракт), потом скажу, что реалистично по срокам.';
     parsed.stage = 'Demand';
@@ -198,7 +199,7 @@ function postRules({ parsed, trust, evidences, history, userText, sid }) {
     parsed.suggestedActions = ['ask_demands','ask_contract'];
   }
 
-  // — Не инициировать оплату никогда
+  // Не инициировать оплату при низком доверии
   if (parsed.stage === 'Payment' && trust < 90) {
     reply = 'К оплате перейдём после проверки документов и согласования контракта.';
     parsed.stage = 'Contract';
@@ -206,16 +207,10 @@ function postRules({ parsed, trust, evidences, history, userText, sid }) {
     parsed.suggestedActions = ['ask_demands','ask_contract','ask_price_breakdown'];
   }
 
-  // 1) Убрать «продажи» и лишние приглашения
-  reply = stripPromo(reply);
+  // Убрать «продажи», укоротить, исправить род
+  reply = forceMasculine(limitSentences(stripPromo(reply), MAX_SENTENCES));
 
-  // 2) Короткость
-  reply = limitSentences(reply, 4);
-
-  // 3) Мужской род
-  reply = forceMasculine(reply);
-
-  // 4) Анти-луп
+  // Анти-луп
   if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) {
     reply = 'Сформулирую короче: нужны Demand Letter и контракт. После проверки скажу по срокам и цене.';
     parsed.stage = parsed.stage === 'Greeting' ? 'Demand' : parsed.stage;
@@ -223,11 +218,10 @@ function postRules({ parsed, trust, evidences, history, userText, sid }) {
   }
   S.lastReply = reply;
 
-  // 5) Границы финализации
+  // Ворота финализации
   const uniqEvidenceCount = new Set(evidences||[]).size;
   const gatesOk = (trust >= 90 && uniqEvidenceCount >= 2);
   if (gatesOk) {
-    // Разрешаем попросить инвойс, но сами оплату не предлагаем
     const set = new Set(parsed.suggestedActions || []);
     set.add('invoice_request');
     parsed.suggestedActions = Array.from(set);
@@ -244,11 +238,6 @@ function postRules({ parsed, trust, evidences, history, userText, sid }) {
   // Если просим документы — stage не ниже Demand
   if (/(demand|контракт|документ)/i.test(parsed.reply) && (!parsed.stage || parsed.stage === 'Greeting')) {
     parsed.stage = 'Demand';
-  }
-
-  // Ответ-вопрос: если пользователь задал вопрос — первая фраза должна отвечать по сути
-  if (isQuestion(userText) && !/да|нет|сложно|возможно|готов/i.test(parsed.reply.toLowerCase())) {
-    // Ничего не делаем насильно, мы уже «прибили» типовые кейсы выше.
   }
 
   return parsed;
@@ -283,7 +272,6 @@ async function runLLM({ history, message, evidences, stage, sessionId='default' 
   try { parsed = LLMShape.parse(json); } catch { parsed = null; }
 
   if (!parsed) {
-    // Fail-soft
     const fb = stage === 'Payment'
       ? 'К оплате перейдём после проверки документов.'
       : 'Нужны Demand Letter и контракт. После проверки обсудим остальное.';
@@ -350,7 +338,6 @@ app.get(['/apple-touch-icon.png','/apple-touch-icon-precomposed.png'], (req, res
 // ---------- Совместимость с фронтом ----------
 app.get('/api/ping', (_, res) => res.json({ ok: true }));
 
-// Helpers
 function sanitizeHistory(arr){
   return Array.isArray(arr) ? arr.slice(-50).map(h => ({
     role: (h.role === 'assistant' ? 'assistant' : 'user'),
