@@ -1,5 +1,5 @@
-// server.js — RenovoGo LLM backend (строже, короче, реалистичнее)
-// v2025-09-16
+// server.js — RenovoGo LLM backend (stable memory, no duplicate asks, clear candidate logic)
+// v2025-09-16-2
 
 import 'dotenv/config';
 import express from 'express';
@@ -27,7 +27,7 @@ app.use(cors({
   credentials: false
 }));
 
-// ---------- Mini Rate Limit (без внешних пакетов) ----------
+// ---------- Mini Rate Limit ----------
 const rlStore = new Map(); // ip -> { count, reset }
 function miniRateLimit(req, res, next){
   if (!req.path.startsWith('/api/')) return next();
@@ -52,7 +52,7 @@ const TEMPERATURE = Number(process.env.TEMPERATURE ?? 0.2);
 const REPLY_MAX_TOKENS = Number(process.env.REPLY_MAX_TOKENS ?? 320);
 const MAX_SENTENCES = Number(process.env.MAX_SENTENCES ?? 4);
 
-// ---------- PRICEBOOK (в системный контекст, не в ответ) ----------
+// ---------- PRICEBOOK (в системный контекст) ----------
 const PRICEBOOK = `
 [PRICEBOOK v1 — CZ/PL]
 — Czech Republic (per candidate):
@@ -94,23 +94,7 @@ const extractFirstJsonObject = (s) => {
 };
 const sentSplit = (text) => String(text||'').split(/(?<=[.!?])\s+/).filter(Boolean);
 const limitSentences = (text, max=4) => sentSplit(text).slice(0, max).join(' ').trim();
-const isQuestion = (s='') => /[?]\s*$/.test(s.trim());
-
-function logError(err, ctx=''){
-  console.error(`[${new Date().toISOString()}] ${ctx}:`, err?.stack || err);
-}
-
-// ---------- Нормализация промо/мусора ----------
-const PROMO_BANNED = [
-  /хотите.*расскажу.*о наших услугах/i,
-  /мы предлагаем широкий спектр услуг/i,
-  /оставьте заявку на сайте/i
-];
-function stripPromo(text){
-  let t = String(text||'');
-  for (const rx of PROMO_BANNED) t = t.replace(rx, '').trim();
-  return t.replace(/\s{2,}/g,' ');
-}
+function logError(err, ctx=''){ console.error(`[${new Date().toISOString()}] ${ctx}:`, err?.stack || err); }
 function forceMasculine(text){
   return String(text||'')
     .replace(/\bрада\b/gi, 'рад')
@@ -121,28 +105,43 @@ function forceMasculine(text){
 
 // ---------- Stage actions ----------
 const ACTION_WHITELIST = [
-  "invoice_request","ask_demands","ask_contract",
-  "ask_price_breakdown","test_one_candidate","goodbye"
+  "ask_demands",
+  "ask_sample_contract",
+  "ask_coop_contract",
+  "ask_price_breakdown",
+  "test_one_candidate",
+  "invoice_request",
+  "goodbye"
 ];
 const ACTION_ORDER = new Map([
-  ["ask_demands",1],["ask_contract",2],
-  ["ask_price_breakdown",3],["test_one_candidate",4],
-  ["invoice_request",5],["goodbye",6]
+  ["ask_demands",1],
+  ["ask_sample_contract",2],
+  ["ask_coop_contract",3],
+  ["ask_price_breakdown",4],
+  ["test_one_candidate",5],
+  ["invoice_request",6],
+  ["goodbye",7]
 ]);
 const normalizeActions = (arr) =>
   Array.from(new Set((Array.isArray(arr)?arr:[])
     .filter(a => ACTION_WHITELIST.includes(a))))
     .sort((a,b)=> (ACTION_ORDER.get(a)||99)-(ACTION_ORDER.get(b)||99));
 
+// ---------- Консистентные ответы по слотам ----------
+const REG_LONGTERM_MONTHS = 6;
+const REG_SEASONAL_MONTHS = 3;
+function registrationAnswer(){
+  return `По долгосрочному — ${REG_LONGTERM_MONTHS} мес назад; по сезонному — ${REG_SEASONAL_MONTHS} мес назад. Очереди нестабильные, поэтому сначала проверю ваш Demand Letter и контракт.`;
+}
+
 // ---------- Микро-состояние сессии ----------
 const sessionState = new Map();
 function getState(sid='default'){
   if (!sessionState.has(sid)) {
     sessionState.set(sid, {
-      greetedOnce: false,
-      saidName: false,
       lastReply: '',
-      lastActions: []
+      lastActions: [],
+      seenEvidences: new Set() // устойчивое хранение доказательств
     });
   }
   return sessionState.get(sid);
@@ -176,27 +175,49 @@ async function createChatWithRetry(payload, tries = 2) {
   throw lastErr;
 }
 
-// ---------- Правила пост-обработки (строже и короче) ----------
+// ---------- Пост-правила (учёт памяти, кандидаты, финализация) ----------
 function postRules({ parsed, trust, evidences, history, userText, sid }) {
   const S = getState(sid);
+
+  // 1) Сливаем входящие доказательства с памятью сессии
+  const inc = new Set(evidences || []);
+  const ev = new Set([...(S.seenEvidences || new Set()), ...inc]); // объединённый набор
+  const isNew = k => inc.has(k) && !S.seenEvidences.has(k);
+
   let reply = String(parsed.reply || '').trim();
 
-  // Жёсткие быстрые ответы на частые вопросы
+  // Быстрые точные ответы
   if (/(как.*зовут|вас зовут|ваше имя|who are you)/i.test(userText)) {
     reply = 'Меня зовут Али.';
     parsed.stage ??= 'Greeting';
   }
-  if (/(слот|регистрац|посольств|консульт).*(дуба|dubai|чех|czech|pol|польш)/i.test(userText)) {
-    reply = 'По CZ/PL сейчас со слотами действительно сложно, в том числе в Дубае. Регистрация возможна после проверки пакета документов и контракта.';
+  // Регистрации/слоты — консистентный текст
+  if (/(когда|последн).*(регистрир|записыва)|слот|очеред/i.test(userText)) {
+    reply = registrationAnswer();
     parsed.stage = 'Demand';
     parsed.needEvidence = true;
-    parsed.suggestedActions = ['ask_demands','ask_contract'];
+    parsed.suggestedActions = ['ask_demands','ask_coop_contract'];
   }
-  if (/(когда|последн).*(регистрир|записыва)/i.test(userText)) {
-    reply = 'Регистрации бывают, но очереди нестабильные. Сначала проверю ваш пакет (Demand/контракт), потом скажу, что реалистично по срокам.';
-    parsed.stage = 'Demand';
-    parsed.needEvidence = true;
-    parsed.suggestedActions = ['ask_demands','ask_contract'];
+
+  // Вопрос про количество кандидатов — отвечаем предметно
+  const askCandidates = /(сколько.*кандидат|кандидат(ов)?\s*(есть|готов|подад)|сколько человек будем подавать)/i.test(userText);
+  if (askCandidates) {
+    if (ev.has('demand_letter') && ev.has('coop_contract_pdf')) {
+      reply = 'Готов подать 1–2 кандидата на старт в Чехию. По остальным согласуем после финализации и слотов.';
+      parsed.stage = parsed.stage === 'Payment' ? 'Payment' : 'Candidate';
+      parsed.needEvidence = false;
+      const set = new Set(parsed.suggestedActions || []);
+      set.add('invoice_request');
+      parsed.suggestedActions = Array.from(set);
+    } else {
+      const miss = [];
+      if (!ev.has('demand_letter')) miss.push('Demand Letter');
+      if (!ev.has('coop_contract_pdf')) miss.push('полный контракт о сотрудничестве');
+      reply = `Смогу подтвердить точное число сразу после ${miss.join(' и ')}. Сейчас ориентир — 1–2 кандидата на старт.`;
+      parsed.stage = 'Contract';
+      parsed.needEvidence = true;
+      parsed.suggestedActions = ['ask_demands','ask_coop_contract'];
+    }
   }
 
   // Не инициировать оплату при низком доверии
@@ -204,23 +225,83 @@ function postRules({ parsed, trust, evidences, history, userText, sid }) {
     reply = 'К оплате перейдём после проверки документов и согласования контракта.';
     parsed.stage = 'Contract';
     parsed.needEvidence = true;
-    parsed.suggestedActions = ['ask_demands','ask_contract','ask_price_breakdown'];
+    parsed.suggestedActions = ['ask_demands','ask_coop_contract','ask_price_breakdown'];
   }
 
-  // Убрать «продажи», укоротить, исправить род
-  reply = forceMasculine(limitSentences(stripPromo(reply), MAX_SENTENCES));
+  // Признание новых доказательств (ACK) + корректные запросы
+  const acks = [];
+  if (isNew('demand_letter')) {
+    acks.push('Спасибо за Demand Letter.');
+    if (!ev.has('coop_contract_pdf')) {
+      acks.push('Теперь пришлите полноценный контракт о сотрудничестве (полная версия, с печатью/подписью).');
+      parsed.stage = 'Contract';
+      parsed.needEvidence = true;
+      parsed.suggestedActions = ['ask_coop_contract'];
+    }
+  }
+  if (isNew('sample_contract_pdf') && !ev.has('coop_contract_pdf')) {
+    acks.push('Пример контракта получен. Для проверки нужен полный контракт о сотрудничестве.');
+    parsed.stage = 'Contract';
+    parsed.needEvidence = true;
+    parsed.suggestedActions = ['ask_coop_contract'];
+  }
+  if (isNew('coop_contract_pdf')) {
+    acks.push('Контракт о сотрудничестве получен.');
+    parsed.stage = 'Contract';
+    parsed.needEvidence = false;
+    const set = new Set(parsed.suggestedActions || []);
+    set.add('ask_price_breakdown');
+    parsed.suggestedActions = Array.from(set);
+  }
+  if (isNew('visa_sample')) acks.push('Пример визы получен.');
+  if (isNew('presentation')) acks.push('Презентация получена.');
+  if (isNew('video')) acks.push('Видео получено.');
+
+  if (acks.length) {
+    reply = (reply ? (limitSentences(reply, MAX_SENTENCES) + ' ') : '') + acks.join(' ');
+  }
+
+  // Правка лишних «реквизитов работодателя» при наличии Demand
+  if (ev.has('demand_letter') && /реквизит/i.test(reply)) {
+    reply = reply.replace(/[^.?!]*реквизит[^.?!]*работодател[^.?!]*[.?!]/gi, '').trim();
+    if (!ev.has('coop_contract_pdf')) {
+      reply += (reply ? ' ' : '') + 'Реквизиты у меня уже есть из Demand. Нужен полный контракт о сотрудничестве.';
+      parsed.stage = 'Contract';
+      parsed.needEvidence = true;
+      parsed.suggestedActions = ['ask_coop_contract'];
+    }
+  }
+
+  // Вопрос про способ оплаты — жёстко «банк»
+  if (/(банк|банковск|crypto|крипто|usdt|криптовалют)/i.test(userText) && /оплат|плат[её]ж|инвойс/i.test(userText)) {
+    reply = 'Банковский инвойс. Криптовалюту не принимаем.';
+    const set = new Set(parsed.suggestedActions || []);
+    set.add('invoice_request');
+    parsed.suggestedActions = Array.from(set);
+    parsed.stage = 'Payment';
+    parsed.needEvidence = false;
+  }
+
+  // Убираем клише и правим род
+  reply = forceMasculine(limitSentences(
+    reply.replace(/(?:оставьте заявку.*?|мы предлагаем широкий спектр услуг)/gi, '').trim(),
+    MAX_SENTENCES
+  ));
 
   // Анти-луп
   if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) {
-    reply = 'Сформулирую короче: нужны Demand Letter и контракт. После проверки скажу по срокам и цене.';
-    parsed.stage = parsed.stage === 'Greeting' ? 'Demand' : parsed.stage;
-    parsed.suggestedActions = ['ask_demands','ask_contract'];
+    reply = 'Коротко: документы принял. Готов подать 1–2 кандидата и перейти к инвойсу.';
+    parsed.stage = 'Payment';
+    const set = new Set(parsed.suggestedActions || []);
+    set.add('invoice_request');
+    parsed.suggestedActions = Array.from(set);
   }
   S.lastReply = reply;
 
-  // Ворота финализации
-  const uniqEvidenceCount = new Set(evidences||[]).size;
-  const gatesOk = (trust >= 90 && uniqEvidenceCount >= 2);
+  // Ворота финализации — требуем контракт
+  const uniqEvidenceCount = ev.size;
+  const hasCoop = ev.has('coop_contract_pdf');
+  const gatesOk = (trust >= 90 && uniqEvidenceCount >= 2 && hasCoop);
   if (gatesOk) {
     const set = new Set(parsed.suggestedActions || []);
     set.add('invoice_request');
@@ -236,9 +317,12 @@ function postRules({ parsed, trust, evidences, history, userText, sid }) {
   parsed.suggestedActions = normalizeActions(parsed.suggestedActions);
 
   // Если просим документы — stage не ниже Demand
-  if (/(demand|контракт|документ)/i.test(parsed.reply) && (!parsed.stage || parsed.stage === 'Greeting')) {
+  if (/(demand|контракт|документ|полный контракт|сотрудничеств)/i.test(parsed.reply) && (!parsed.stage || parsed.stage === 'Greeting')) {
     parsed.stage = 'Demand';
   }
+
+  // 2) Сохраняем объединённый набор в сессию (память)
+  S.seenEvidences = ev;
 
   return parsed;
 }
@@ -274,13 +358,13 @@ async function runLLM({ history, message, evidences, stage, sessionId='default' 
   if (!parsed) {
     const fb = stage === 'Payment'
       ? 'К оплате перейдём после проверки документов.'
-      : 'Нужны Demand Letter и контракт. После проверки обсудим остальное.';
+      : 'Нужны Demand Letter и контракт о сотрудничестве. После проверки обсудим сроки и цену.';
     parsed = {
       reply: fb,
       confidence: clamp(trust, 0, 60),
       stage: stage || 'Demand',
       needEvidence: true,
-      suggestedActions: ['ask_demands','ask_contract']
+      suggestedActions: ['ask_demands','ask_coop_contract']
     };
   }
 
@@ -345,14 +429,29 @@ function sanitizeHistory(arr){
     stage: h.stage ? String(h.stage) : undefined
   })) : [];
 }
+
+// Нормализация ключей доказательств из фронта
 function normalizeEvidenceKey(k){
-  const map = {
-    contract:'contract_pdf', contractpdf:'contract_pdf', договор:'contract_pdf',
-    demand:'demand_letter', demandletter:'demand_letter', деманд:'demand_letter',
-    card:'business_card', визитка:'business_card', сайт:'website'
-  };
   const key = String(k || '').toLowerCase().trim();
-  return map[key] || key;
+  const map = new Map([
+    // Demand
+    ['demand','demand_letter'], ['demandletter','demand_letter'], ['деманд','demand_letter'],
+    // Contracts
+    ['sample','sample_contract_pdf'], ['sample_contract','sample_contract_pdf'],
+    ['contract_sample','sample_contract_pdf'], ['пример_контракта','sample_contract_pdf'],
+    ['contract_pdf','coop_contract_pdf'], // важно для вашего фронта
+    ['contract','coop_contract_pdf'], ['contractpdf','coop_contract_pdf'], ['договор','coop_contract_pdf'],
+    ['coop_contract','coop_contract_pdf'], ['full_contract','coop_contract_pdf'],
+    ['контракт_о_сотрудничестве','coop_contract_pdf'],
+    // Other proofs
+    ['visa','visa_sample'], ['visa_scan','visa_sample'], ['пример_визы','visa_sample'], ['visa_sample','visa_sample'],
+    ['card','business_card'], ['визитка','business_card'],
+    ['site','website'], ['сайт','website'], ['website','website'],
+    ['reviews','reviews'], ['отзывы','reviews'],
+    ['registry','registry_proof'], ['uradprace','registry_proof'], ['регистрация','registry_proof'],
+    ['presentation','presentation'], ['deck','presentation'], ['video','video'], ['youtube','video']
+  ]);
+  return map.get(key) || key;
 }
 
 // /api/reply — основной
