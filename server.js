@@ -14,9 +14,7 @@ app.use(morgan('dev'));
 
 // ---------- CORS ----------
 const allowed = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 app.use(cors({
   origin: (origin, cb) => {
@@ -31,29 +29,16 @@ app.use(cors({
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
 
-// ---------- PRICEBOOK ----------
+// ---------- PRICEBOOK (в контекст без «училок») ----------
 const PRICEBOOK = `
 [PRICEBOOK v1 — CZ/PL]
-
 — Czech Republic (per candidate):
-  • 3 months — €270 (initial) + €150 (final after PDF)
-  • 6 months — €300 (initial) + €150 (final after PDF)
-  • 9 months — €350 (initial) + €150 (final after PDF)
-  • 24 months (recommended for TRC) — €350 (initial) + €350 (final after PDF)
-  • Embassy registration (long-term only) — €500 = €250 upfront + €250 after confirmation.
-    If no appointment is secured within 6 months — refund €250 advance.
-    Not applicable for seasonal contracts.
-
-— Poland (per candidate):
-  • 9 months seasonal only — €350 (initial) + €150 (final after PDF)
-  • 12 months (1-year contract) — €350 (initial) + €350 (final after PDF)
-  • Embassy registration — same logic as CZ long-term (if applicable).
-
-— General:
-  • Free: verification of any contract received from other sources (send to help@renovogo.com)
-  • Instructions: every PDF includes guidelines to verify authenticity.
-  • All services strictly under Czech & EU law.
-  • Negotiation policy: client may bargain (“куплю контракт за €300, но после получения PDF”).
+  • 3m €270 + €150  • 6m €300 + €150  • 9m €350 + €150
+  • 24m €350 + €350
+  • Embassy reg (LT only): €500 = €250 + €250 (refund €250 if >6m no slot)
+— Poland:
+  • 9m seasonal €350 + €150  • 12m €350 + €350
+— General: free verification; every PDF has verify guidelines; all under CZ/EU law.
 `;
 
 // ---------- Schemas ----------
@@ -69,22 +54,191 @@ const ChatSchema = z.object({
   })).optional()
 });
 
-// ---------- Helpers ----------
+// ---------- Small utils ----------
+const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+const pick  = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const trimToSentences = (text, max = 6) => {
+  const parts = String(text || '').split(/(?<=[.!?])\s+/).filter(Boolean);
+  return parts.slice(0, max).join(' ').trim();
+};
+const extractFirstJsonObject = (s) => {
+  const m = String(s||'').match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try { return JSON.parse(m[0]); } catch { return null; }
+};
+const lastAssistantReplyFromHistory = (history=[]) =>
+  String((history || []).filter(h => h.role==='assistant').slice(-1)[0]?.content || '').trim();
+
+// ---------- «живые» реплики по темам ----------
+const FALLBACK_HUMAN = [
+  "Не понял вас. О чём речь?",
+  "Секунду, вы что имеете в виду?",
+  "Поясните, я не уловил мысль.",
+  "Не совсем понял. Конкретнее можно?",
+  "О чём говорим? Дайте контекст.",
+  "Подождите, не понял. Сформулируйте проще.",
+  "Сейчас не понял. Что вы хотите конкретно?",
+  "Я выпал из контекста. Повторите коротко."
+];
+
+const ASK_DOCS_HUMAN = [
+  "Вы сначала о вакансии мне раскажите",
+  "У вас есть писмьо запрос, или вы так просто решили поговорить?",
+  "Покажите мне контракт, я его проверю, тогда поговорим",
+  "Вы не профисионал своего дела, что за вакансия, сколько платят, куда требуется кандидат?",
+  "Я не первый день в этом бизнесе, вы мне еще нечего не расказали а уже что-то требуете."
+];
+
+const TOO_EARLY_PAY_HUMAN = [
+  "Какая оплата, вы что с дуба рухнули? Я вас впервые вижу.",
+  "Серьёзно? Мы ещё ничего не проверили, а вы уже про деньги.",
+  "Сейчас речи об оплате быть не может. Сначала документы.",
+  "Платить за воздух не собираюсь.",
+  "Вы шутите? Документы покажите — потом обсудим.",
+  "Не торопите события. Сначала проверим вашего работодателя и его бумаги.",
+  "Нет. Сначала проверка, потом оплата после визы.",
+  "Стоп. Документы → проверка → уже потом может будут деньги."
+];
+
+const SLOT_QUESTIONS = [
+  "Как вы решаете проблему со слотами в посольство? Сколько ваши люди ждут?",
+  "По регестрациям в посольство Чехии всё сложно. Как у вас с назначениями?",
+  "Где записываете и в какие сроки? Конкретику дайте.",
+  "Сколько времени уходит у ваших кандидатов на то чтобы получить слот? Реальные цифры."
+];
+
+const CRYPTO_SKEPTIC = [
+  "Крипту не люблю. Рисково. Там одни машеники",
+  "Крипта? Плохой знак. Лучше счёт-фактуру от фирмы, а не эти кошельки.",
+  "Бывает, что берут криптой, но мне спокойнее через счёт-фактуру или банковским переводом.",
+  "Если честно — криптой пользуются кто попало. Давайте нормальный инвойс."
+];
+
+const HR_CONTACT = [
+  "Дайте контакт работодателя. Меня интересует реальный человек, а то с вами не возможно договорится.",
+  "Нужен прямой контакт к работодателю. Без этого не двигаемся."
+];
+
+const BARGAIN = [
+  "Дорого. Если дам сразу 10 кандидатов — будет скидка?",
+  "А если я приведу пятёрку людей сразу, вы цену двинете?",
+  "По цене давайте приземлимся. За одного столько не дам.",
+  "Окей, но цифры не устраивают. Давайте обсуждать."
+];
+
+const URADPRACE_PUSH = [
+  "Ссылку на uradprace дадите? Я проверю.",
+  "Где проверка на uradprace? Без неё — слабая история.",
+  "Покажите, где ваша позиция в реестре uradprace.",
+  "У вас есть регистрация в реестре? Ссылку сюда."
+];
+
+const CANDIDATE_TEST = [
+  "Хорошо, один кандидат на тест — возможно. Но сначала бумаги.",
+  "Не спешим. Сначала проверка, потом дам одного человека в возможно.",
+  "Один тестовый кандидат — обсуждаемо, но без бумаг не двигаюсь."
+];
+
+const CLOSING_READY = [
+  "Окей. Давайте финализировать.",
+  "Похоже, разобрались. Шлите инвойс — проверю и двинемся.",
+  "Хорошо. Реквизиты присылайте, посмотрю и согласуем шаги."
+];
+
+// Запретные паттерны (грубый фильтр)
+const BANNED_PATTERNS = [
+  /кошел(е|ё)к|wallet/i,       // не даёт свои реквизиты
+  /переведите.*мне/i,
+  /я оплачу первым/i,
+  /гарантирую.*виз/i,          // «гарантия визы»
+  /связи.*посольств/i          // выдуманные связи
+];
+
+// ---------- Помощники ----------
 function buildMessages({ history = [], message, trust, evidences }) {
   const sys = {
     role: 'system',
     content:
       SYSTEM_PROMPT +
-      `\n\n[Контекст-сервера]\nТекущий trust=${trust}. Доказательства=${JSON.stringify(evidences || [])}.` +
-      `\n${PRICEBOOK}\nПомни: отвечай СТРОГИМ JSON (см. формат в промпте).`
+      `\n\n[Контекст]\ntrust=${trust}; evidences=${JSON.stringify(evidences || [])}\n${PRICEBOOK}\n` +
+      `Отвечай СТРОГО одним JSON-объектом (см. формат).`
   };
 
   const trimmed = history.slice(-12).map(h => ({
-    role: h.role,
-    content: h.content
+    role: h.role, content: h.content
   }));
 
   return [sys, ...trimmed, { role: 'user', content: message }];
+}
+
+// «оживляем» ответ: тон, вопросы, анти-ранняя оплата, анти-повторы
+function humanize({ parsed, trust, evidences, history }) {
+  let reply = String(parsed.reply || '').trim();
+  const lastBot = lastAssistantReplyFromHistory(history);
+  const uniqEvidenceCount = new Set(evidences || []).size;
+  const gatesOk = (trust >= 90 && uniqEvidenceCount >= 2);
+
+  // Запрещённые фразы → мягкий перехват к документам
+  if (!reply || BANNED_PATTERNS.some(rx => rx.test(reply))) {
+    reply = pick(ASK_DOCS_HUMAN);
+    parsed.stage = parsed.stage === 'Payment' ? 'Contract' : (parsed.stage || 'Greeting');
+    parsed.needEvidence = true;
+    parsed.suggestedActions = ["ask_demands","ask_contract","ask_uradprace"];
+    parsed.confidence = Math.min(parsed.confidence ?? trust, 70);
+  }
+
+  // Если модель «уходит» в оплату до ворот — жёсткий живой щелчок
+  if (!gatesOk && parsed.stage === 'Payment') {
+    reply = pick(TOO_EARLY_PAY_HUMAN);
+    parsed.stage = 'Contract';
+    parsed.needEvidence = true;
+    const set = new Set(parsed.suggestedActions || []);
+    set.add('ask_demands'); set.add('ask_contract'); set.add('ask_uradprace');
+    parsed.suggestedActions = Array.from(set);
+    parsed.confidence = Math.min(parsed.confidence ?? trust, 80);
+  }
+
+  // Поддержка «тем»: если в истории скоро после приветствия — прокидываем неудобные вопросы
+  const userText = (history || []).filter(h=>h.role==='user').slice(-1)[0]?.content || '';
+  if (/слот|запис|посольств/i.test(userText)) {
+    reply = reply || pick(SLOT_QUESTIONS);
+  }
+  if (/крипт|crypto|usdt|btc/i.test(userText)) {
+    reply = reply || pick(CRYPTO_SKEPTIC);
+  }
+  if (/hr|эйчар|кадр|отдел кадров|контакт/i.test(userText)) {
+    reply = reply || pick(HR_CONTACT);
+  }
+  if (/сколько|цена|дорог|ценник|стоим/i.test(userText)) {
+    reply = reply || pick(BARGAIN);
+  }
+  if (/uradprace|у?радпрац/i.test(userText)) {
+    reply = reply || pick(URADPRACE_PUSH);
+  }
+  if (/кандидат|people|workers|людей/i.test(userText)) {
+    reply = reply || pick(CANDIDATE_TEST);
+  }
+
+  // Ворота пройдены → короткое «финализируем»
+  if (gatesOk && parsed.stage !== 'Payment') {
+    const set = new Set(parsed.suggestedActions || []);
+    set.add('invoice_request');
+    parsed.suggestedActions = Array.from(set);
+    reply = reply || pick(CLOSING_READY);
+    parsed.stage = 'Payment';
+    parsed.needEvidence = false;
+    parsed.confidence = Math.max(parsed.confidence ?? 0, trust);
+  }
+
+  // Анти-повтор: если слово в слово как прошлый бот → другая фраза
+  if (reply && lastBot && reply.trim().toLowerCase() === lastBot.trim().toLowerCase()) {
+    reply = pick(FALLBACK_HUMAN);
+  }
+
+  parsed.reply = trimToSentences(reply, 6);
+  if (!parsed.reply) parsed.reply = pick(FALLBACK_HUMAN);
+
+  return parsed;
 }
 
 async function runLLM({ history, message, evidences, stage }) {
@@ -99,58 +253,41 @@ async function runLLM({ history, message, evidences, stage }) {
 
   const resp = await groq.chat.completions.create({
     model: MODEL,
-    temperature: 0.4,
-    response_format: { type: 'json_object' }, // ждём строгий JSON
+    temperature: 0.35,
+    top_p: 0.9,
+    frequency_penalty: 0.3,
+    presence_penalty: 0.0,
+    max_tokens: 380,
+    response_format: { type: 'json_object' },
     messages
   });
 
+  // --- извлекаем валидный JSON
   const raw = resp.choices?.[0]?.message?.content || '{}';
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    parsed = {
-      reply: "Не понял. Давайте вернёмся к разговору и начнём с документов (Demand/контракт/uradprace).",
-      confidence: Math.min(40, trust),
-      stage: stage || "Greeting",
-      needEvidence: true,
-      suggestedActions: ["ask_demands","ask_contract","ask_uradprace"]
-    };
-  }
+  const json = extractFirstJsonObject(raw);
+  let parsed = json ?? {
+    reply: pick(FALLBACK_HUMAN),
+    confidence: clamp(trust, 0, 40),
+    stage: stage || "Greeting",
+    needEvidence: true,
+    suggestedActions: ["ask_demands","ask_contract","ask_uradprace"]
+  };
 
-  // Принудительная логика финализации (ворота + кол-во пруфов)
-  const uniqEvidenceCount = new Set(evidences || []).size;
-  if (trust >= 90 && uniqEvidenceCount >= 2) {
-    const actions = new Set(parsed.suggestedActions || []);
-    actions.add('invoice_request');
-    parsed.suggestedActions = Array.from(actions);
-    parsed.reply = parsed.reply || "Финализируем: пришлите реквизиты/счёт. После проверки оплатим.";
-    parsed.stage = 'Payment';
-    parsed.needEvidence = false;
-    parsed.confidence = Math.max(parsed.confidence || 0, trust);
-  } else {
-    if (parsed.stage === 'Payment') {
-      parsed.stage = 'Contract';
-      parsed.reply = "Пока рано к оплате. Покажите ещё документы: Demand, контракт и проверку работодателя (uradprace).";
-      const actions = new Set(parsed.suggestedActions || []);
-      actions.add('ask_demands'); actions.add('ask_contract'); actions.add('ask_uradprace');
-      parsed.suggestedActions = Array.from(actions);
-      parsed.needEvidence = true;
-      parsed.confidence = Math.min(parsed.confidence || trust, 80);
-    }
-  }
-
-  // Страховка: поля по умолчанию
-  parsed.reply ||= "Слушаю. Какие у вас документы для проверки (Demand/контракт/uradprace)?";
-  parsed.stage ||= "Greeting";
-  parsed.confidence = Math.max(0, Math.min(100, Number(parsed.confidence || trust)));
+  // Страховки типов
+  parsed.reply = String(parsed.reply || '').trim();
+  parsed.stage = String(parsed.stage || stage || "Greeting");
+  parsed.confidence = clamp(Number(parsed.confidence ?? trust), 0, 100);
   parsed.needEvidence = Boolean(parsed.needEvidence);
   parsed.suggestedActions = Array.isArray(parsed.suggestedActions) ? parsed.suggestedActions : [];
 
+  // Оживляем и дожимаем логику
+  parsed = humanize({ parsed, trust, evidences, history });
+
+  const uniqEvidenceCount = new Set(evidences || []).size;
   return { trust, evidenceCount: uniqEvidenceCount, result: parsed };
 }
 
-// ---------- Заглушки для корня и иконок ----------
+// ---------- Root & assets ----------
 app.get('/', (_, res) => {
   res.type('html').send(`<!doctype html>
 <meta charset="utf-8">
@@ -169,7 +306,6 @@ app.get('/favicon.ico', (req, res) => {
   res.set('Cache-Control', 'public, max-age=31536000, immutable');
   res.send(emptyIco);
 });
-
 app.get(['/apple-touch-icon.png','/apple-touch-icon-precomposed.png'], (req, res) => {
   const emptyPng = Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAoMBg7rj2/8AAAAASUVORK5CYII=',
@@ -183,7 +319,7 @@ app.get(['/apple-touch-icon.png','/apple-touch-icon-precomposed.png'], (req, res
 // ---------- Совместимость с фронтом ----------
 app.get('/api/ping', (_, res) => res.json({ ok: true }));
 
-// /api/reply ожидает {sessionId?, agent_key?, user_text, evidence?, evidences?, history[]}
+// /api/reply — основной
 app.post('/api/reply', async (req, res) => {
   try {
     const b = req.body || {};
@@ -194,7 +330,7 @@ app.post('/api/reply', async (req, res) => {
       (Number.isFinite(b.evidence) ? Array.from({ length: Math.max(0, b.evidence|0) }, (_, i) => `proof_${i+1}`) :
       []);
 
-    // История в формат ChatSchema
+    // История
     const history = Array.isArray(b.history) ? b.history.map(h => ({
       role: (h.role === 'assistant' ? 'assistant' : 'user'),
       content: String(h.content || ''),
@@ -209,6 +345,7 @@ app.post('/api/reply', async (req, res) => {
     };
 
     const parsed = ChatSchema.partial({ stage: true }).parse(dataForLLM);
+
     const { trust, evidenceCount, result } = await runLLM({
       history: parsed.history,
       message: parsed.message,
@@ -220,7 +357,13 @@ app.post('/api/reply', async (req, res) => {
       text: result.reply,
       agent: { name: 'Али', avatar: 'https://renovogo.com/welcome/training/ali.png' },
       evidence_delta: 0,
-      meta: { ok: true, trust, evidenceCount, stage: result.stage, actions: result.suggestedActions }
+      meta: {
+        ok: true,
+        trust,
+        evidenceCount,
+        stage: result.stage,
+        actions: result.suggestedActions
+      }
     });
   } catch (e) {
     console.error(e);
@@ -228,7 +371,7 @@ app.post('/api/reply', async (req, res) => {
   }
 });
 
-// /api/score — простой скоринг для подсказок менеджеру
+// /api/score — подсказки менеджеру (лёгкая эвристика)
 app.post('/api/score', (req, res) => {
   try {
     const b = req.body || {};
@@ -246,18 +389,16 @@ app.post('/api/score', (req, res) => {
     const bad  = [];
 
     if (/(здрав|прив|добрый)/i.test(msgText)) good.push('Вежливое приветствие'); else bad.push('Нет приветствия');
-    if (/renovogo|renovogo\.com/i.test(msgText)) good.push('Дали проверяемый факт (бренд/сайт)');
-    if (evidences.length >= 2) good.push('Приложили ≥2 доказательства'); else bad.push('Мало доказательств (визитка/документы)');
+    if (/renovogo|renovogo\.com/i.test(msgText)) good.push('Дали проверяемый факт');
+    if (evidences.length >= 2) good.push('Приложили ≥2 доказательства'); else bad.push('Мало доказательств');
     if (/(контракт|сч[её]т|инвойс|готовы начать)/i.test(msgText)) good.push('Есть финальный CTA');
 
-    const final = Math.max(0, Math.min(100,
-      Math.round(
-        (/(здрав|прив|добрый)/i.test(msgText) ? 15 : 0) +
-        (/renovogo|renovogo\.com/i.test(msgText) ? 15 : 0) +
-        ((evidences.length >= 2) ? 35 : 0) +
-        (/(контракт|сч[её]т|инвойс|готовы начать)/i.test(msgText) ? 35 : 0)
-      )
-    ));
+    const final = clamp(Math.round(
+      (/(здрав|прив|добрый)/i.test(msgText) ? 15 : 0) +
+      (/renovogo|renovogo\.com/i.test(msgText) ? 15 : 0) +
+      ((evidences.length >= 2) ? 35 : 0) +
+      (/(контракт|сч[её]т|инвойс|готовы начать)/i.test(msgText) ? 35 : 0)
+    ), 0, 100);
 
     res.json({ final, good, bad, trust, evidences: evidences.length });
   } catch (e) {
@@ -266,7 +407,7 @@ app.post('/api/score', (req, res) => {
   }
 });
 
-// Служебные эндпоинты под старые маршруты
+// Совместимость со старым роутом
 app.post('/chat', async (req, res) => {
   try {
     const data = ChatSchema.parse(req.body);
