@@ -69,21 +69,22 @@ const extractFirstJsonObject = (s) => {
 const lastAssistantReplyFromHistory = (history=[]) =>
   String((history || []).filter(h => h.role==='assistant').slice(-1)[0]?.content || '').trim();
 
-// --- actions normalize ---
+// --- actions normalize (урезали до нужных) ---
 const ACTION_WHITELIST = [
-  "invoice_request","ask_demands","ask_contract","ask_uradprace",
-  "ask_employer_contact","ask_price_breakdown","test_one_candidate","goodbye"
+  "invoice_request","ask_demands","ask_contract",
+  "ask_price_breakdown","test_one_candidate","goodbye"
 ];
 const ACTION_ORDER = new Map([
-  ["ask_demands",1],["ask_contract",2],["ask_uradprace",3],
-  ["ask_employer_contact",4],["ask_price_breakdown",5],
-  ["test_one_candidate",6],["invoice_request",7],["goodbye",8]
+  ["ask_demands",1],["ask_contract",2],
+  ["ask_price_breakdown",3],["test_one_candidate",4],
+  ["invoice_request",5],["goodbye",6]
 ]);
 const normalizeActions = (arr) =>
   Array.from(
     new Set((Array.isArray(arr)?arr:[]).filter(a => ACTION_WHITELIST.includes(a)))
   ).sort((a,b)=> (ACTION_ORDER.get(a)||99)-(ACTION_ORDER.get(b)||99));
 
+// — человечные фразы
 const FALLBACK_HUMAN = [
   "Не понял вас. О чём речь?",
   "Секунду, вы что имеете в виду?",
@@ -96,77 +97,55 @@ const FALLBACK_HUMAN = [
 ];
 
 const ASK_DOCS_HUMAN = [
-  "Вы сначала о вакансии мне раскажите",
-  "У вас есть писмьо запрос, или вы так просто решили поговорить?",
-  "Покажите мне контракт, я его проверю, тогда поговорим",
-  "Вы не профисионал своего дела, что за вакансия, сколько платят, куда требуется кандидат?",
-  "Я не первый день в этом бизнесе, вы мне еще нечего не расказали а уже что-то требуете."
+  "Сначала пришлите запрос по вакансии (Demand) — я проверю.",
+  "Нужен Demand или ваш договор о сотрудничестве. Тогда обсудим дальше.",
+  "Отправьте документы по вакансии и ваш контракт — без бумаг не двигаюсь.",
+  "Мне нужны конкретные документы: Demand Letter и контракт. Потом пойдём дальше.",
+  "Давайте по-взрослому: документы — затем обсуждения."
 ];
 
 const TOO_EARLY_PAY_HUMAN = [
-  "Какая оплата, вы что с дуба рухнули? Я вас впервые вижу.",
-  "Серьёзно? Мы ещё ничего не проверили, а вы уже про деньги.",
-  "Сейчас речи об оплате быть не может. Сначала документы.",
-  "Платить за воздух не собираюсь.",
-  "Вы шутите? Документы покажите — потом обсудим.",
-  "Не торопите события. Сначала проверим вашего работодателя и его бумаги.",
-  "Нет. Сначала проверка, потом оплата после визы.",
-  "Стоп. Документы → проверка → уже потом может будут деньги."
+  "Какая оплата? Мы ещё ничего не проверили.",
+  "Оплата обсуждается после проверки документов.",
+  "Пока рано говорить про деньги. Сначала Demand и контракт.",
+  "Платить за воздух не буду. Документы — вперёд.",
+  "Не торопите события: проверки → потом инвойс."
 ];
 
-const SLOT_QUESTIONS = [
-  "Как вы решаете проблему со слотами в посольство? Сколько ваши люди ждут?",
-  "По регестрациям в посольство Чехии всё сложно. Как у вас с назначениями?",
-  "Где записываете и в какие сроки? Конкретику дайте.",
-  "Сколько времени уходит у ваших кандидатов на то чтобы получить слот? Реальные цифры."
-];
-
+// тематические подсказки (урезано до нужного)
 const CRYPTO_SKEPTIC = [
-  "Крипту не люблю. Рисково. Там одни машеники",
-  "Крипта? Плохой знак. Лучше счёт-фактуру от фирмы, а не эти кошельки.",
-  "Бывает, что берут криптой, но мне спокойнее через счёт-фактуру или банковским переводом.",
-  "Если честно — криптой пользуются кто попало. Давайте нормальный инвойс."
-];
-
-const HR_CONTACT = [
-  "Дайте контакт работодателя. Меня интересует реальный человек, а то с вами не возможно договорится.",
-  "Нужен прямой контакт к работодателю. Без этого не двигаемся."
+  "Крипта — риск. Предпочитаю счёт-фактуру и банковский перевод.",
+  "Крипта? Не лучший знак. Давайте нормальный инвойс.",
+  "Я работаю по инвойсу от компании, а не по кошелькам."
 ];
 
 const BARGAIN = [
-  "Дорого. Если дам сразу 10 кандидатов — будет скидка?",
-  "А если я приведу пятёрку людей сразу, вы цену двинете?",
-  "По цене давайте приземлимся. За одного столько не дам.",
-  "Окей, но цифры не устраивают. Давайте обсуждать."
-];
-
-const URADPRACE_PUSH = [
-  "Ссылку на uradprace дадите? Я проверю.",
-  "Где проверка на uradprace? Без неё — слабая история.",
-  "Покажите, где ваша позиция в реестре uradprace.",
-  "У вас есть регистрация в реестре? Ссылку сюда."
+  "Если дам сразу 10 кандидатов — будет скидка?",
+  "При объёме в пятёрку людей двигаем цену?",
+  "По цене давайте приземлимся. За одного столько не дам."
 ];
 
 const CANDIDATE_TEST = [
-  "Хорошо, один кандидат на тест — возможно. Но сначала бумаги.",
-  "Не спешим. Сначала проверка, потом дам одного человека в возможно.",
-  "Один тестовый кандидат — обсуждаемо, но без бумаг не двигаюсь."
+  "Один тестовый кандидат — возможно, но сначала документы.",
+  "Тест обсудим после Demand и контракта.",
+  "Один на пробу — ок, но без бумаг не двигаюсь."
 ];
 
 const CLOSING_READY = [
-  "Окей. Давайте финализировать.",
-  "Похоже, разобрались. Шлите инвойс — проверю и двинемся.",
-  "Хорошо. Реквизиты присылайте, посмотрю и согласуем шаги."
+  "Хорошо, финализируем.",
+  "Ок, шлите инвойс — проверю и двинемся.",
+  "Готово. Жду реквизиты и счёт."
 ];
 
-// Запретные паттерны (грубый фильтр)
+// Запретные паттерны
 const BANNED_PATTERNS = [
-  /кошел(е|ё)к|wallet/i,       // не даёт свои реквизиты
+  /кошел(е|ё)к|wallet/i,
   /переведите.*мне/i,
   /я оплачу первым/i,
-  /гарантирую.*виз/i,          // «гарантия визы»
-  /связи.*посольств/i          // выдуманные связи
+  /гарантирую.*виз/i,
+  /связи.*посольств/i
 ];
+
 // ---------- Сборка сообщений в LLM ----------
 function buildMessages({ history = [], message, trust, evidences }) {
   const sys = {
@@ -196,31 +175,28 @@ function humanize({ parsed, trust, evidences, history }) {
     reply = pick(ASK_DOCS_HUMAN);
     parsed.stage = parsed.stage === 'Payment' ? 'Contract' : (parsed.stage || 'Demand');
     parsed.needEvidence = true;
-    parsed.suggestedActions = ["ask_demands","ask_contract","ask_uradprace"];
+    parsed.suggestedActions = ["ask_demands","ask_contract"];
     parsed.confidence = Math.min(parsed.confidence ?? trust, 70);
   }
 
-  // Ранняя оплата до «ворот» → жёсткий человечный щелчок
+  // Ранняя оплата до «ворот»
   if (!gatesOk && parsed.stage === 'Payment') {
     reply = pick(TOO_EARLY_PAY_HUMAN);
     parsed.stage = 'Contract';
     parsed.needEvidence = true;
     const set = new Set(parsed.suggestedActions || []);
-    set.add('ask_demands'); set.add('ask_contract'); set.add('ask_uradprace');
+    set.add('ask_demands'); set.add('ask_contract'); set.add('ask_price_breakdown');
     parsed.suggestedActions = Array.from(set);
     parsed.confidence = Math.min(parsed.confidence ?? trust, 80);
   }
 
-  // Тематические подталкивания по последнему сообщению пользователя
+  // Подталкивания по последнему тексту пользователя (урезано)
   const userText = (history || []).filter(h=>h.role==='user').slice(-1)[0]?.content || '';
-  if (/слот|запис|посольств/i.test(userText))  reply ||= pick(SLOT_QUESTIONS);
   if (/крипт|crypto|usdt|btc/i.test(userText)) reply ||= pick(CRYPTO_SKEPTIC);
-  if (/hr|эйчар|кадр|отдел кадров|контакт/i.test(userText)) reply ||= pick(HR_CONTACT);
-  if (/сколько|цена|дорог|ценник|стоим/i.test(userText))     reply ||= pick(BARGAIN);
-  if (/uradprace|у?радпрац/i.test(userText))                 reply ||= pick(URADPRACE_PUSH);
-  if (/кандидат|people|workers|людей/i.test(userText))       reply ||= pick(CANDIDATE_TEST);
+  if (/сколько|цена|дорог|ценник|стоим/i.test(userText)) reply ||= pick(BARGAIN);
+  if (/кандидат|people|workers|людей|тест/i.test(userText)) reply ||= pick(CANDIDATE_TEST);
 
-  // Ворота пройдены → короткое «финализируем»
+  // Ворота пройдены → «финализируем»
   if (gatesOk && parsed.stage !== 'Payment') {
     const set = new Set(parsed.suggestedActions || []);
     set.add('invoice_request');
@@ -231,7 +207,7 @@ function humanize({ parsed, trust, evidences, history }) {
     parsed.confidence = Math.max(parsed.confidence ?? 0, trust);
   }
 
-  // Анти-повтор: если слово в слово как прошлый бот → другая фраза
+  // Анти-повтор
   if (reply && lastBot && reply.trim().toLowerCase() === lastBot.trim().toLowerCase()) {
     reply = pick(FALLBACK_HUMAN);
   }
@@ -240,8 +216,8 @@ function humanize({ parsed, trust, evidences, history }) {
   if (!parsed.reply) parsed.reply = pick(FALLBACK_HUMAN);
   parsed.suggestedActions = normalizeActions(parsed.suggestedActions);
 
-  // Если мы просим документы, логично держать stage не ниже Demand
-  if (!gatesOk && /Demand|контракт|uradprace/i.test(parsed.reply) && parsed.stage === 'Greeting') {
+  // Если просим документы — stage не ниже Demand
+  if (!gatesOk && /(Demand|контракт)/i.test(parsed.reply) && parsed.stage === 'Greeting') {
     parsed.stage = 'Demand';
   }
 
@@ -266,11 +242,10 @@ async function runLLM({ history, message, evidences, stage }) {
     frequency_penalty: 0.3,
     presence_penalty: 0.0,
     max_tokens: 380,
-    response_format: { type: 'json_object' }, // жёсткий JSON
+    response_format: { type: 'json_object' },
     messages
   });
 
-  // --- извлекаем валидный JSON
   const raw = resp.choices?.[0]?.message?.content || '{}';
   const json = extractFirstJsonObject(raw);
   let parsed = json ?? {
@@ -278,7 +253,7 @@ async function runLLM({ history, message, evidences, stage }) {
     confidence: clamp(trust, 0, 40),
     stage: stage || "Greeting",
     needEvidence: true,
-    suggestedActions: ["ask_demands","ask_contract","ask_uradprace"]
+    suggestedActions: ["ask_demands","ask_contract"]
   };
 
   // Страховки типов
@@ -379,7 +354,7 @@ app.post('/api/reply', async (req, res) => {
   }
 });
 
-// /api/score — подсказки менеджеру (простая эвристика)
+// /api/score — подсказки менеджеру
 app.post('/api/score', (req, res) => {
   try {
     const b = req.body || {};
