@@ -132,7 +132,7 @@ export function computeTrust({ baseTrust = 20, evidences = [], history = [], las
   const { uniq, hard, med, sup, uniqSet } = countKinds(evidences);
   const hasCoop = uniqSet.has('coop_contract_pdf') || uniqSet.has('contract_pdf');
 
-  score += hard * 8;
+  score += hard * 10;
   score += Math.min(3, med) * 4;
   score += Math.min(3, sup) * 2;
   if (hasCoop) score += 4; // полный контракт всё ещё даёт доп. доверие
