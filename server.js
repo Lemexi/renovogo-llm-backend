@@ -1,5 +1,5 @@
-// server.js — RenovoGo LLM backend (stable memory, no robotic ACKs, realistic flow)
-// v2025-09-16-9
+// server.js — RenovoGo LLM backend (stable memory, cold client Ali, anti-repeats)
+// v2025-09-16-11
 
 /* ──────────────────────────────────────────────────────────────
    ЧАСТЬ 1. БАЗА: импорты, app, CORS, мини-рейт-лимит
@@ -57,6 +57,8 @@ const TEMPERATURE = Number(process.env.TEMPERATURE ?? 0.2);
 const REPLY_MAX_TOKENS = Number(process.env.REPLY_MAX_TOKENS ?? 320);
 const MAX_SENTENCES = Number(process.env.MAX_SENTENCES ?? 4);
 
+// PRICEBOOK остаётся только для внутреннего контекста модели;
+// Али как клиент НИКОГДА не озвучивает цены и не инициирует оплату.
 const PRICEBOOK = `
 [PRICEBOOK v1 — CZ/PL (fees, not salaries)]
 — Czech Republic (service fees per candidate):
@@ -114,6 +116,23 @@ function forceMasculine(text){
     .replace(/\bсмогла\b/gi, 'смог')
     .replace(/\bмогла\b/gi, 'мог');
 }
+
+// [ALI-CLIENT] Нормализация и запрет «продажных» слов у клиента
+function stripSalesy(text=''){
+  let t = String(text);
+  const salesy = [
+    /(?:мы|у\s*нас)\s+предлагаем/i,
+    /оставьте\s+заявку/i,
+    /наш\s+пакет/i,
+    /мы\s+сделаем/i,
+    /мы\s+предоставим/i,
+    /скидк/i,
+    /акци/i
+  ];
+  for (const r of salesy) t = t.replace(r, '').trim();
+  return t.replace(/\s{2,}/g, ' ');
+}
+
 function splitSentences(t=''){
   return String(t).split(/(?<=[.!?])\s+/).filter(s => s.trim());
 }
@@ -169,7 +188,14 @@ const sessionState = new Map();
     seenEvidences: Map<key, { count: number, lastAt: number }>,
     evidenceDetails: Record<string, any>,
     lastObjection: string,
-    demandFacts: Record<string, any>
+    demandFacts: Record<string, any>,
+    turn: number,
+    repeatStats: {
+      phraseCounts: Map<string, number>,
+      lastUsedTurn: Map<string, number>,
+      topicCounts: Record<string, number>
+    },
+    alreadyCommitted: boolean
   }>
 */
 function getState(sid='default'){
@@ -180,7 +206,14 @@ function getState(sid='default'){
       seenEvidences: new Map(),
       evidenceDetails: Object.create(null),
       lastObjection: '',
-      demandFacts: Object.create(null)
+      demandFacts: Object.create(null),
+      turn: 0,
+      repeatStats: {
+        phraseCounts: new Map(),
+        lastUsedTurn: new Map(),
+        topicCounts: Object.create(null)
+      },
+      alreadyCommitted: false
     });
   }
   return sessionState.get(sid);
@@ -303,46 +336,29 @@ const normalizeActions = (arr) =>
 const REG_LONGTERM_MONTHS = 6;
 const REG_SEASONAL_MONTHS = 3;
 function registrationAnswer(){
-  return `По долгосрочному — ${REG_LONGTERM_MONTHS} мес назад; по сезонному — ${REG_SEASONAL_MONTHS} мес назад. Очереди нестабильные. Сначала проверю Demand Letter и контракт.`;
+  return `По долгосрочному — ${REG_LONGTERM_MONTHS} мес назад; по сезонному — ${REG_SEASONAL_MONTHS} мес назад. Очереди нестабильные.`;
 }
 
-// greeting helpers
-function extractUserName({ history = [], evidenceDetails = {} } = {}) {
-  const cardName = evidenceDetails?.business_card?.name;
-  if (cardName && String(cardName).trim()) return String(cardName).trim();
-  const lastUser = [...(history||[])].reverse().find(h => h.role === 'user');
-  const txt = (lastUser?.content || '').trim();
-  const m = txt.match(/(?:я|меня\s+зовут|это)\s+([A-ZА-ЯЁ][a-zа-яё\-\']{1,30})/i);
-  if (m) return m[1];
-  return '';
-}
-function rewriteVacancyQuestionToSupplierRole(text=''){
-  let t = String(text);
-  t = t.replace(/какие\s+вакансии[^.?!]*ищете[^.?!]*[.?!]?/gi, 'Какие вакансии у вас доступны?');
-  t = t.replace(/мы\s+работаем[^.?!]*чех[иия][^.?!]*польш[^.?!]*уже\s+давно[^.?!]*[.?!]?/gi, '');
-  t = t.replace(/\s{2,}/g, ' ').replace(/\s+([?.!])/g, '$1').trim();
-  return t;
-}
-function craftHumanGreeting({ base='', name='' } = {}){
-  const variants = name
-    ? [
-        `Привет, ${name}. Чем могу помочь?`,
-        `${name}, рад знакомству. С какими задачами ко мне пришли?`,
-        `${name}, мне тоже приятно. Какие вакансии у вас сейчас открыты?`
-      ]
-    : [
-        'Привет! Чем могу помочь?',
-        'Рад знакомству. Какие вакансии у вас сейчас открыты?',
-        'Здравствуйте. С чего начнём: какие вакансии у вас доступны?'
-      ];
-  let t = rewriteVacancyQuestionToSupplierRole(base);
-  if (!t || t.length < 3) {
+// [ALI-CLIENT] Greeting — только короткое живое приветствие, без автопродажи и без опросника
+function craftHumanGreeting({ base='' } = {}){
+  const variants = [
+    'Привет.',
+    'Здравствуйте.',
+    'Слушаю.',
+    'Добрый день.'
+  ];
+  let t = String(base || '').trim();
+  if (!t || t.length < 2) {
     t = variants[Math.floor(Math.random()*variants.length)];
-  } else if (!/[?]$/.test(t) && !/ваканси/i.test(t)) {
-    t = `${t} Какие вакансии у вас доступны?`;
+  } else {
+    // Обрезаем до одной короткой фразы без хвостов
+    t = splitSentences(t)[0] || variants[0];
   }
   return forceMasculine(t);
 }
+
+// [ALI-CLIENT] Больше не переписываем в «Какие вакансии…» — оставляем как есть
+function rewriteVacancyQuestionToSupplierRole(text=''){ return String(text||'').trim(); }
 
 /* ──────────────────────────────────────────────────────────────
    ЧАСТЬ 5. LLM: сборка сообщений, ретраи, пост-правила
@@ -357,9 +373,10 @@ function buildMessages({ history = [], message, trust, evidences, evidenceDetail
       `— trust=${trust}; evidences=${JSON.stringify(evidences || [])}\n` +
       `— evidence_details=${JSON.stringify(evidenceDetails || {})}\n` +
       PRICEBOOK + `\n` +
-      `Правила: Demand Letter — это запрос/описание вакансии (без реквизитов работодателя). ` +
-      `Реквизиты и стоимость — только в контракте о сотрудничестве/инвойсе. ` +
-      `Запрещено требовать "контракт работодателя" или "реквизиты работодателя" — нужен ТОЛЬКО наш B2B-контракт. ` +
+      // [ALI-CLIENT] Усиливаем «клиентское» поведение на старте
+      `Правила Greeting: короткое приветствие без продажи и без требований. Не навязываться. ` +
+      `Документы проси только реактивно — когда собеседник сам предложит сотрудничество/вакансии или спросит, что нужно. ` +
+      `Не инициируй оплату и не озвучивай цены. ` +
       `Отвечай СТРОГО одним JSON-объектом. Будь кратким (до ${MAX_SENTENCES} предложений).`
   };
   const trimmed = (history||[]).slice(-12).map(h => ({ role: h.role, content: h.content }));
@@ -378,17 +395,14 @@ async function createChatWithRetry(payload, tries = 2) {
 /** Жёсткий редиректор любых формулировок «контракта/реквизитов работодателя» в «наш B2B контракт» */
 function redirectEmployerContractToCoop(text=''){
   let t = String(text || '');
-  // Явные формулировки «контракт работодателя / employer contract»
   t = t.replace(
     /\b(контракт(?!\s*о\s*сотрудничестве)[^.!?\n]*\b(работодател[ьяею]|employer|company)[^.!?\n]*)/gi,
     'контракт о сотрудничестве (наш B2B)'
   );
-  // Любые «реквизиты работодателя / employer details»
   t = t.replace(
     /\b(реквизит\w*\s*(работодател[ьяею]|employer|company)|employer\s*(details|requisites))\b/gi,
     'реквизиты для инвойса (наши B2B)'
   );
-  // Смягчаем косвенные упоминания «документы работодателя»
   t = t.replace(
     /\b(документ\w*\s*(работодател[ьяею]|employer|company))\b/gi,
     'B2B-документы по сотрудничеству'
@@ -396,7 +410,7 @@ function redirectEmployerContractToCoop(text=''){
   return t;
 }
 
-// «человечные» возражения на низком доверии
+// «человечные» возражения на низком доверии — остаются (но без предложения оплаты/счёта)
 function chooseObjection({ sid, userText='', trust=0, uniqEvidence=0, hasDemand=false, hasCoop=false }){
   const S = getState(sid);
   const rnd = seededRand(sid);
@@ -405,29 +419,29 @@ function chooseObjection({ sid, userText='', trust=0, uniqEvidence=0, hasDemand=
   const mentionsSlots  = /(слот|очеред|термин|запис)/i.test(userText);
 
   const poolBudget = [
-    'Честно, для меня это сейчас дорого. Давайте начнём с одного кандидата и закрепим результат.',
-    'Пока не готов закрывать всю сумму — покажите, как пройдёт первый кейс, и двинемся дальше.',
-    'Дорого выходит на старте. Снизим риски: один кандидат, остальное — после подтверждения хода дела.'
+    'Честно, для меня это сейчас дорого.',
+    'Пока не готов закрывать всю сумму.',
+    'Дорого выходит на старте.'
   ];
   const poolAfterPermit = [
-    'Готов оплатить после разрешения на работу или хотя бы подтверждения регистрации.',
-    'Оплачу, когда увижу разрешению на работу — до этого хочу минимизировать риски.',
-    'Как только будет подтверждение по регистрации в посольство, перейду к оплате без задержек.'
+    'Предпочитаю оплату после визы или хотя бы подтверждения регистрации.',
+    'Оплачу после подтверждения регистрации/разрешения на работу.',
+    'Как только будет подтверждение по регистрации, перейду к оплате.'
   ];
   const poolSlots = [
-    'Вижу, что с регестрацией в посольство нестабильно сейчас. Предлагаю стартовать с 1 кандидатом без предоплаты, оплачу после визы.',
-    'Давайте зафиксируем двух кандидат, а оплату расширим после того как получу от Вас PDF файл.',
-    'Сначала запись — потом увеличим объём и финансирование. Так будет безопаснее.'
+    'С регистрацией сейчас нестабильно. Не хочу торопиться с оплатой.',
+    'Давайте без спешки — сначала запись/подтверждение, потом вернусь к оплате.',
+    'Сначала запись, потом обсудим оплату.'
   ];
   const poolGeneric = [
-    'Давайте начнём осторожно: один кандидат, остальное — после промежуточной проверки.',
-    'Мне важно увидеть первый успешный кейс. После него готов масштабироваться и обсуждать оплату.',
-    'Готов продолжить, но пока без полной оплаты. Покажите движение по документам — и закрываем счёт.'
+    'Осторожно отношусь к предоплатам. Нужна прозрачность по документам.',
+    'Мне важно видеть движение по документам, прежде чем обсуждать оплату.',
+    'Я за аккуратный старт. Без спешки.'
   ];
   const poolDelay = [
-    'Возьму неделю на внутреннее согласование и подбор вам персонала. Напишу вам в этот же чат.',
-    'Нужно до 5 рабочих дней на проверку и сбор кандидатов. Вернусь с апдейтом.',
-    'Поставлю себе напоминание на следующую неделю и вернусь к вам.'
+    'Возьму время на внутреннюю проверку и подберу кандидатов.',
+    'Нужно несколько дней на оценку.',
+    'Вернусь с апдейтом позже.'
   ];
 
   let chosen = '';
@@ -445,26 +459,80 @@ function chooseObjection({ sid, userText='', trust=0, uniqEvidence=0, hasDemand=
   }
   S.lastObjection = chosen;
 
-  let nudge = '';
-  if (!hasDemand) nudge = 'Скиньте Demand Letter с описанием вакансий — от него оттолкнёмся.';
-  else if (!hasCoop) nudge = 'Нужен полный контракт о сотрудничестве B2B — проверю условия и вернусь по оплате.';
-  else if (uniqEvidence < 2) nudge = 'Сейчас нет свободных кандидатов — вернусь с подборкой через неделю.';
-  else nudge = 'Начнём с одного кандидата и параллельно согласуем оплату по этапам.';
-
   let stageSuggestion = 'Contract';
   if (!hasDemand) stageSuggestion = 'Demand';
   else if (!hasCoop) stageSuggestion = 'Contract';
   else if (uniqEvidence < 2) stageSuggestion = 'Candidate';
   else stageSuggestion = 'Payment';
 
-  return { text: joinUniqueSentences([chosen, nudge]), stage: stageSuggestion };
+  return { text: chosen, stage: stageSuggestion };
 }
 
-// пост-правила
+/* [ALI-CLIENT] анти-повторы и кулдауны */
+const STOP_PHRASES = [
+  'как вы?',
+  'ищете работу в польше',
+  'ищете работу в чехии',
+  'какие вакансии у вас доступны?',
+  'какие вакансии у вас сейчас открыты?'
+];
+const MAX_SAME_PHRASE = 1;     // за всю сессию
+const COOLDOWN_TURNS   = 6;    // кулдаун повторной фразы
+const MAX_QUESTIONS_IN_MSG = 1;
+
+function normPhrase(s){ return String(s||'').toLowerCase().replace(/[^\p{L}\p{N}\s?.!,-]/gu,'').trim(); }
+
+function repetitionGuard(reply, sid){
+  const S = getState(sid);
+  const { phraseCounts, lastUsedTurn } = S.repeatStats;
+  const turn = S.turn;
+
+  let sentences = splitSentences(reply);
+  const out = [];
+
+  let questionsUsed = 0;
+
+  for (let s of sentences){
+    const ns = normPhrase(s);
+
+    // запрещённые паттерны/стоп-фразы
+    if (STOP_PHRASES.some(p => ns.includes(p))) continue;
+
+    // кулдаун
+    const lastTurn = lastUsedTurn.get(ns) ?? -999;
+    if (turn - lastTurn < COOLDOWN_TURNS) continue;
+
+    // глобальный лимит фразы
+    const cnt = phraseCounts.get(ns) ?? 0;
+    if (cnt >= MAX_SAME_PHRASE) continue;
+
+    // лимит вопросов в одном сообщении
+    if (/\?\s*$/.test(s)) {
+      if (questionsUsed >= MAX_QUESTIONS_IN_MSG) continue;
+      questionsUsed++;
+    }
+
+    out.push(s);
+    // учёт
+    phraseCounts.set(ns, cnt + 1);
+    lastUsedTurn.set(ns, turn);
+  }
+
+  // если всё выпилили — оставить короткий нейтральный ответ
+  if (out.length === 0) return 'Ок.';
+
+  return out.join(' ');
+}
+
+/* ──────────────────────────────────────────────────────────────
+   ЧАСТЬ 5.1. POST-RULES (главная логика «клиента»)
+   ────────────────────────────────────────────────────────────── */
+
 function postRules({ parsed, trust, evidences, history, userText, sid, evidenceDetails }) {
   const S = getState(sid);
+  S.turn = (S.turn || 0) + 1;
 
-  // 0) Нормализуем вход пользователя: насильно уводим от «контракта работодателя»
+  // 0) Нормализуем вход: запрет «контракт/реквизиты работодателя»
   userText = redirectEmployerContractToCoop(userText);
 
   const inc = new Set((evidences || []).filter(k => !S.seenEvidences.has(k)));
@@ -478,25 +546,24 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     parsed.stage ??= 'Greeting';
   }
 
-  // Регистрации/слоты
+  // Регистрации/слоты — без «продажи»
   if (/(когда|последн).*(регистрир|записыва)|слот|очеред/i.test(userText)) {
     reply = registrationAnswer();
     parsed.stage = 'Demand';
-    parsed.needEvidence = true;
-    parsed.suggestedActions = ['ask_demands','ask_coop_contract'];
+    parsed.needEvidence = false;
   }
 
-  // Greeting rewrite
+  // [ALI-CLIENT] Greeting: только короткое приветствие без требований
   const isEarly = (history || []).length <= 2 || (!parsed.stage || parsed.stage === 'Greeting');
   if (isEarly) {
-    const userName = extractUserName({ history, evidenceDetails });
-    reply = craftHumanGreeting({ base: reply, name: userName });
+    reply = craftHumanGreeting({ base: reply });
     parsed.stage = 'Greeting';
   } else {
+    // Не превращаем в «Какие вакансии…»
     reply = rewriteVacancyQuestionToSupplierRole(reply);
   }
 
-  // Ответы на базовые вопросы из DEMAND
+  // Ответы по DEMAND-фактам — только если менеджер спросил
   const DF = getDemandFacts(sid);
   const askedSalary = /(зарплат|salary|сколько.*(получ|net))/i.test(userText);
   const askedHouse  = /(жиль|accommodat|общежит|проживан)/i.test(userText);
@@ -510,34 +577,18 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     else if (askedLoc)   { reply = formatFactsShort(DF,'location') || reply; parsed.stage ??= 'Demand'; }
     else if (askedWhatJob) { reply = formatFactsShort(DF,'all') || reply; parsed.stage ??= 'Demand'; }
   }
-  // Изредка уточняем один пункт (12%)
-  const rndProbe = seededRand(sid)();
-  if (Object.keys(DF).length && rndProbe < 0.12) {
-    if (!DF.salary?.value) reply = joinUniqueSentences([reply, 'Уточню: нетто ставка по этой позиции какая?']);
-    else if (!DF.hours_monthly && !DF.schedule) reply = joinUniqueSentences([reply, 'Уточню график: сколько часов в месяц/смены?']);
-    else if (!DF.accommodation?.cost_eur) reply = joinUniqueSentences([reply, 'Жильё: напомните ориентир по стоимости?']);
+
+  // [ALI-CLIENT] Реактивные просьбы: если менеджер явно спрашивает «что нужно»
+  if (/(что\s+нужно|what.*need|какие\s+документ\w*\s+нужн)/i.test(userText)) {
+    // просим кратко: описание вакансии (Demand) и наш B2B-контракт
+    reply = 'Обычно достаточно описания вакансии (Demand) и нашего B2B-контракта.';
+    parsed.stage = hasEvidence(sid,'demand_letter') ? 'Contract' : 'Demand';
+    parsed.needEvidence = true;
+    setActions.add('ask_demands');
+    setActions.add('ask_coop_contract');
   }
 
-  // Вопрос про количество кандидатов
-  const askCandidates = /(сколько.*кандидат|кандидат(ов)?\s*(есть|готов|подад)|сколько человек будем подавать)/i.test(userText);
-  if (askCandidates) {
-    if (hasEvidence(sid,'demand_letter') && hasEvidence(sid,'coop_contract_pdf')) {
-      reply = 'Готов подать 1–2 кандидата на старт в Чехию. Остальные — после регистрации в посольство.';
-      parsed.stage = parsed.stage === 'Payment' ? 'Payment' : 'Candidate';
-      parsed.needEvidence = false;
-      setActions.add('invoice_request');
-    } else {
-      const miss = [];
-      if (!hasEvidence(sid,'demand_letter')) miss.push('Demand Letter');
-      if (!hasEvidence(sid,'coop_contract_pdf')) miss.push('полный контракт о сотрудничестве');
-      reply = `Подтвержу точное число сразу после ${miss.join(' и ')}. Сейчас ориентир — 1–2 кандидата на старт.`;
-      parsed.stage = 'Contract';
-      parsed.needEvidence = true;
-      parsed.suggestedActions = ['ask_demands','ask_coop_contract'];
-    }
-  }
-
-  // Тихая фиксация материалов
+  // Тихая фиксация материалов (без «acks»)
   if (inc.has('business_card') || (evidenceDetails && evidenceDetails.business_card)) {
     bumpEvidence(sid, 'business_card', evidenceDetails?.business_card);
   }
@@ -546,94 +597,110 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     const facts = extractDemandFactsFromDetails(evidenceDetails || {});
     if (Object.keys(facts).length) setDemandFacts(sid, facts);
 
+    // Никаких «спасибо, получил»; без продавливания
     if (!hasEvidence(sid,'coop_contract_pdf')) {
-      setActions.add('ask_coop_contract');
       parsed.stage = 'Contract';
       parsed.needEvidence = true;
-      reply = joinUniqueSentences([reply,
-        'Запрос вижу. Направление сложное: по Индии сейчас с регестрацией в посольство вобше нестабильно. Начнём с одного кандидата, остальные — после подтверждения записи.'
-      ]);
-    } else {
-      reply = joinUniqueSentences([reply, formatFactsShort(getDemandFacts(sid), 'all') || '']);
+      setActions.add('ask_coop_contract');
     }
   }
   if (inc.has('sample_contract_pdf')) {
     bumpEvidence(sid, 'sample_contract_pdf');
     if (!hasEvidence(sid,'coop_contract_pdf')) {
-      setActions.add('ask_coop_contract');
       parsed.stage = 'Contract';
       parsed.needEvidence = true;
-      reply = joinUniqueSentences([reply, 'Отправьте, пожалуйста, полный договор B2B.']);
+      setActions.add('ask_coop_contract');
     }
   }
   if (inc.has('coop_contract_pdf')) {
     bumpEvidence(sid, 'coop_contract_pdf');
     parsed.stage = 'Contract';
     parsed.needEvidence = false;
-    setActions.add('ask_price_breakdown');
-    reply = joinUniqueSentences([reply, 'Спасибо, как изучу вернусь к вам.']);
+    // не добавляем ask_price_breakdown — Али не продавец
   }
   for (const key of ['visa_sample','presentation','video','website','company_registry','reviews','registry_proof','price_breakdown','slot_plan','invoice_template','nda']) {
     if (inc.has(key)) bumpEvidence(sid, key, evidenceDetails?.[key]);
   }
 
-  // Политика оплаты — только банк
+  // Политика оплаты — только банк (и только реактивно), позиция «после визы/регистрации»
   if (/(банк|банковск|crypto|крипто|usdt|btc|eth|криптовалют)/i.test(userText) && /оплат|плат[её]ж|инвойс|сч[её]т/i.test(userText)) {
-    reply = 'Банковский инвойс. Криптовалюту не принимаем.';
-    setActions.add('invoice_request');
+    reply = 'Предпочитаю оплату после визы или как минимум после подтверждения регистрации. Крипту не люблю, счёт — банковский.';
     parsed.stage = 'Payment';
     parsed.needEvidence = false;
+    // НЕ добавляем invoice_request — Али не инициирует оплату
   }
 
-  // Возражения при низком доверии
+  // Возражения при низком доверии — без навязывания «начнём с одного кандидата»
   const uniqEvidence = evidenceCountUnique(sid);
-  const hasDemand = hasEvidence(sid,'demand_letter');
-  const hasCoop   = hasEvidence(sid,'coop_contract_pdf');
+  const hasDemandEv = hasEvidence(sid,'demand_letter');
+  const hasCoopEv   = hasEvidence(sid,'coop_contract_pdf');
   if (parsed.stage === 'Payment' && trust < 90) {
-    const obj = chooseObjection({ sid, userText, trust, uniqEvidence, hasDemand, hasCoop });
+    const obj = chooseObjection({ sid, userText, trust, uniqEvidence, hasDemand: hasDemandEv, hasCoop: hasCoopEv });
     reply = obj.text;
     parsed.stage = obj.stage;
-    parsed.needEvidence = !hasDemand || !hasCoop || uniqEvidence < 2;
-    if (!hasDemand) setActions.add('ask_demands');
-    if (!hasCoop) setActions.add('ask_coop_contract');
-    if (hasCoop) setActions.add('ask_price_breakdown');
+    parsed.needEvidence = !hasDemandEv || !hasCoopEv || uniqEvidence < 2;
+    if (!hasDemandEv) setActions.add('ask_demands');
+    if (!hasCoopEv) setActions.add('ask_coop_contract');
   }
 
-  // Если ответ снова спрашивает базовые вещи, а факты есть — подменим на факты
-  if (Object.keys(DF).length) {
-    if (/какая\s+зарплат/i.test(reply)) reply = formatFactsShort(DF,'salary') || reply;
-    if (/есть\s+ли\s+жиль|жиль[её]\s+будет|стоимость\s+жиль/i.test(reply)) reply = formatFactsShort(DF,'accommodation') || reply;
-    if (/график|сколько\s+час/i.test(reply)) reply = formatFactsShort(DF,'hours') || reply;
-    if (/какая\s+локац|где\s+работ/i.test(reply)) reply = formatFactsShort(DF,'location') || reply;
+  /* ====> ЧАСТЬ 5.2 — условия покупки и позиция Али (этапные «отговорки») <==== */
+  const stance = applyAliPurchasePolicy({
+    reply, stage: parsed.stage, trust,
+    evidences, userText, sid,
+    hasDemandEv, hasCoopEv
+  });
+  if (stance) {
+    reply = joinUniqueSentences([reply, stance.reply || '']);
+    if (stance.stage) parsed.stage = stance.stage;
+    if (typeof stance.needEvidence === 'boolean') parsed.needEvidence = stance.needEvidence;
+    for (const a of (stance.actions || [])) setActions.add(a);
   }
 
-  // Санитария (+ жёсткий редиректор на наш B2B)
+  /* ====> ЧАСТЬ 5.3 — вероятностное решение о покупке (Али покупает) <==== */
+  const buyDecision = applyAliPurchaseDecision({
+    reply,
+    stage: parsed.stage,
+    trust,
+    evidences,
+    userText,
+    sid
+  });
+  if (buyDecision) {
+    reply = joinUniqueSentences([reply, buyDecision.reply]);
+    if (buyDecision.stage) parsed.stage = buyDecision.stage;
+    if (typeof buyDecision.needEvidence === 'boolean') parsed.needEvidence = buyDecision.needEvidence;
+    for (const a of (buyDecision.actions || [])) setActions.add(a);
+  }
+
+  // Если модель случайно вставила цены/прайс — вырезаем (Али не говорит о ценах)
+  reply = reply.replace(/(?:€|\$\s?|\b(czk|eur|usd)\b)[\s:]*[\d\s.,]+/gi, '').trim();
+
+  // Санитария (+ жёсткий редиректор на наш B2B) и анти-продажа
   reply = redirectEmployerContractToCoop(reply);
   reply = stripEmployerRequisitesRequests(reply);
   reply = stripRequisitesFromDemand(reply);
   reply = stripRoboticAcks(reply);
   reply = cleanSales(reply);
+  reply = stripSalesy(reply);
   reply = forceMasculine(reply);
   reply = limitSentences(reply, MAX_SENTENCES);
 
-  // Анти-луп
+  // Анти-луп: если ответ повторяет предыдущий — упростим до короткого
   if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) {
-    reply = 'Предлагаю стартовать с одного кандидата. Документы проверю и дальше будем работать по прайсу.';
-    parsed.stage = hasCoop ? 'Payment' : 'Contract';
-    if (!hasCoop) { setActions.add('ask_coop_contract'); parsed.needEvidence = true; }
-    setActions.add('test_one_candidate');
+    reply = 'Ок.';
   }
+
+  // [ALI-CLIENT] анти-повторы/кулдауны/лимит вопросов
+  reply = repetitionGuard(reply, sid);
+
   S.lastReply = reply;
 
-  // Финальные ворота
+  // Финальные ворота: даже при высоком доверии НЕ инициируем «инвойс/счёт»
   const gatesOk = (trust >= 90 && evidenceCountUnique(sid) >= 2 && hasEvidence(sid,'coop_contract_pdf'));
   if (gatesOk) {
-    setActions.add('invoice_request');
-    if (!/инвойс|сч[её]т|реквизит/i.test(reply)) {
-      reply = conciseJoin([reply, 'Готов перейти к финализации — пришлите реквизиты для оплаты.']);
-    }
     parsed.stage = 'Payment';
     parsed.needEvidence = false;
+    // НЕ добавляем invoice_request
   }
 
   parsed.reply = reply.trim();
@@ -646,70 +713,273 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   return parsed;
 }
 
-async function runLLM({ history, message, evidences, stage, sessionId='default', evidenceDetails }) {
-  const trust = computeTrust({
-    baseTrust: 20,
-    evidences: Array.from(new Set(evidences || [])),
-    history: history || [],
-    lastUserText: message || ''
-  });
+/* ──────────────────────────────────────────────────────────────
+   ЧАСТЬ 5.2. УСЛОВИЯ ПОКУПКИ И ПОЗИЦИЯ АЛИ (этапные отговорки)
+   ────────────────────────────────────────────────────────────── */
 
-  // Входной текст также нормализуем (никаких «контрактов работодателя»)
-  const safeMessage = redirectEmployerContractToCoop(message || '');
+function applyAliPurchasePolicy({
+  reply = '',
+  stage = 'Greeting',
+  trust = 0,
+  evidences = [],
+  userText = '',
+  sid = 'default',
+  hasDemandEv = false,
+  hasCoopEv = false
+} = {}) {
+  // Триггеры, на которые Али реагирует «покупательскими» отговорками
+  const rx = {
+    pressure: /(срочн|прямо сейчас|немедленн|today|сегодня|within\s*24|24\s*час)/i,
+    prepay: /(предоплат|аванс|оплатить\s*до|до\s*визы|advance\s*payment)/i,
+    cryptoOnly: /(только\s*крипт|only\s*crypto)/i,
+    discount: /(скидк|дешевле|сбросьте\s*цену|дискаунт)/i,
+    unrealDeadline: /(2\s*дня|48\s*час|за\s*два\s*дня|через\s*сутки)/i,
+    payBeforeDocs: /(оплат.*(до|без)\s*(документ|контракт|demand|регистрац))/i
+  };
 
-  const messages = buildMessages({
-    history, message: safeMessage, trust, evidences, evidenceDetails
-  });
+  // Базовые «позиции» по этапам — короткие, без продажи
+  const baseByStage = {
+    Greeting:  'Давайте не спешить. Сначала разберёмся, о чём речь.',
+    Demand:    'Сначала описание вакансии и проверяемость. Про оплату — после визы или хотя бы регистрации.',
+    Contract:  'Хочу видеть договорённости на бумаге. Оплату обсуждаю после визы/регистрации.',
+    Candidate: 'Готов двигаться аккуратно. Предоплату не люблю — сначала подтверждения.',
+    Payment:   'Предпочитаю после визы или подтверждения записи. Крипта — не приоритет, банковский счёт ок.',
+    Closing:   'Если всё понятно, вернусь позже с решением.'
+  };
 
-  const resp = await createChatWithRetry({
-    model: MODEL,
-    temperature: TEMPERATURE,
-    top_p: 0.9,
-    frequency_penalty: 0.4,
-    presence_penalty: 0.0,
-    max_tokens: REPLY_MAX_TOKENS,
-    response_format: { type: 'json_object' },
-    messages
-  });
+  // Специфические отговорки по триггерам
+  const rebuttals = [];
+  if (rx.pressure.test(userText)) rebuttals.push('Мне некомфортно при спешке. Давайте спокойно, без давления.');
+  if (rx.prepay.test(userText) || rx.payBeforeDocs.test(userText)) rebuttals.push('Предоплату не рассматриваю. Сначала подтверждения по документам.');
+  if (rx.cryptoOnly.test(userText)) rebuttals.push('Крипту не люблю. Если дойдём до оплаты — предпочту банковский счёт.');
+  if (rx.discount.test(userText)) rebuttals.push('Торг здесь ни к чему. Важнее прозрачность и проверяемость.');
+  if (rx.unrealDeadline.test(userText)) rebuttals.push('Сроки «за два дня» звучат нереалистично. Давайте без иллюзий.');
 
-  const raw = resp?.choices?.[0]?.message?.content || '{}';
-  const json = extractFirstJsonObject(raw);
+  // Стадийные корректировки (без продажи и без CTA)
+  let nextStage = stage;
+  let needEvidence = undefined;
+  const actions = [];
 
-  let parsed;
-  try { parsed = LLMShape.parse(json); } catch { parsed = null; }
-
-  if (!parsed) {
-    const fb = stage === 'Payment'
-      ? 'Начнём осторожно: один кандидат, остальное — после промежуточной проверки.'
-      : 'Нужны Demand Letter и контракт о сотрудничестве. После проверки обсудим сроки и цену.';
-    parsed = {
-      reply: fb,
-      confidence: clamp(trust, 0, 60),
-      stage: stage || 'Demand',
-      needEvidence: true,
-      suggestedActions: ['ask_demands','ask_coop_contract']
-    };
+  // Если очень рано — ничего про оплату не инициировать вообще
+  if (stage === 'Greeting') {
+    // только позиция и отговорки при давлении
   }
 
-  // типобезопасность
-  parsed.reply = String(parsed.reply || '').trim();
-  parsed.stage = String(parsed.stage || stage || "Greeting");
-  parsed.confidence = clamp(Number(parsed.confidence ?? trust), 0, 100);
-  parsed.needEvidence = Boolean(parsed.needEvidence);
-  parsed.suggestedActions = Array.isArray(parsed.suggestedActions) ? parsed.suggestedActions : [];
+  // На Demand/Contract можно спокойно напомнить про документы — но уже реактивно сделано в 5.1
+  if ((stage === 'Demand' || stage === 'Contract') && !(hasDemandEv && hasCoopEv)) {
+    // не добавляем действий — 5.1 уже поставил ask_demands/ask_coop_contract при явном запросе
+  }
 
-  // Пост-правила
-  parsed = postRules({
-    parsed,
-    trust,
-    evidences,
-    history,
-    userText: safeMessage,
-    sid: sessionId || 'default',
-    evidenceDetails
-  });
+  // На Payment, если доверие ещё низкое — стоп-кран (но без смены на «кандидаты/инвойс»)
+  if (stage === 'Payment' && trust < 90) {
+    // Отговорка будет через chooseObjection в 5.1; здесь добавим только мягкую позицию
+    rebuttals.push('Мне нужна уверенность в процессе. Платежи — после подтверждений.');
+    needEvidence = needEvidence ?? (!hasDemandEv || !hasCoopEv);
+  }
 
-  return { trust, evidenceCount: evidenceCountUnique(sessionId), result: parsed };
+  // Итоговая сборка
+  const base = baseByStage[stage] || '';
+  const merged = joinUniqueSentences([base, rebuttals.join(' ')]).trim();
+
+  if (!merged) return null;
+
+  return {
+    reply: merged,
+    stage: nextStage,
+    needEvidence,
+    actions
+  };
+}
+
+/* ──────────────────────────────────────────────────────────────
+   ЧАСТЬ 5.3. АЛИ ПОКУПАЕТ (вероятности, условия, крипта/банк)
+   ────────────────────────────────────────────────────────────── */
+
+/**
+ * Условия, при которых Али ВООБЩЕ может купить:
+ *  - есть визитка (business_card)
+ *  - есть Demand Letter (demand_letter)
+ *  - есть Пример рабочего контракта (sample_contract_pdf)
+ *  - есть Контракт о сотрудничестве (coop_contract_pdf)
+ *  - доверие >= 70
+ *
+ * При выполнении — решаем по вероятностям (база от доверия + бонус от качества «работы с возражениями»).
+ * Али может сам сказать «Готов сотрудничать» (без прямого вопроса менеджера),
+ * выбрать 1–10 кандидатов и попросить счёт (банк по умолчанию).
+ * Если менеджер активно «переводит» на крипту убедительным питчем — Али может согласиться (вероятностно).
+ */
+
+function applyAliPurchaseDecision({
+  reply = '',
+  stage = 'Greeting',
+  trust = 0,
+  evidences = [],
+  userText = '',
+  sid = 'default'
+} = {}) {
+  const S = getState(sid);
+
+  // Чтобы не продавал дважды
+  if (S.alreadyCommitted) return null;
+
+  // 1) Проверяем обязательные артефакты
+  const hasCard   = hasEvidence(sid, 'business_card');
+  const hasDemand = hasEvidence(sid, 'demand_letter');
+  const hasSample = hasEvidence(sid, 'sample_contract_pdf');
+  const hasCoop   = hasEvidence(sid, 'coop_contract_pdf');
+
+  const prereqsOk = hasCard && hasDemand && hasSample && hasCoop && trust >= 70;
+  if (!prereqsOk) return null;
+
+  // 2) Базовые вероятности покупки по доверию
+  function baseProbByTrust(t){
+    if (t >= 100) return 0.50;
+    if (t >= 90)  return 0.35;
+    if (t >= 80)  return 0.05;
+    return 0.01; // t ∈ [70..79]
+  }
+
+  // 3) Оценка качества «работы с возражениями» в ТЕКУЩЕМ сообщении менеджера (userText)
+  const objectionFx = evaluateObjectionHandling(userText); // {level:'strong'|'weak'|'none', bonus:0..0.10}
+  // 4) Сильный или слабый «питч» на крипту
+  const cryptoFx = evaluateCryptoPitch(userText); // {level:'strong'|'weak'|'none'}
+
+  // 5) Считаем вероятность покупки
+  let pBuy = baseProbByTrust(trust) + objectionFx.bonus;
+  pBuy = Math.max(0, Math.min(0.85, pBuy)); // безопасный кап
+
+  // 6) Пробуем «срабатывание» покупки (сид-рандом для стабильности по сессии, но с шагом по ходам)
+  const rnd = seededRand(`${sid}#buy#${S.turn || 0}`);
+  const willBuy = rnd() < pBuy;
+
+  if (!willBuy) {
+    // Не покупает на этом ходе — ничего не делаем.
+    return null;
+  }
+
+  // === ПОКУПКУ СОВЕРШАЕМ ===
+
+  // 7) Выбираем количество кандидатов (1–10) с уклоном в малые числа
+  const candidates = chooseCandidateCount(rnd);
+
+  // 8) По умолчанию — банковский счёт; если менеджер активно «толкает» крипту — решаем вероятностно, согласится ли
+  const wantsCrypto = decideCryptoAcceptance({ trust, cryptoFx, rnd });
+
+  // 9) Собираем финальный ответ Али (без «продажи», просто констатация)
+  let buyLine = `Я готов с вами сотрудничать. Стартуем с ${candidates} кандидат${pluralRu(candidates, 'ом','ами','ами')}. `;
+  buyLine += wantsCrypto
+    ? 'Предоставьте, пожалуйста, криптовалютные реквизиты для оплаты.'
+    : 'Предоставьте, пожалуйста, банковский счёт для оплаты.';
+
+  // 10) Возвращаем результат: переводим на Payment и просим счёт (Али имеет право запросить счёт, т.к. он — покупатель)
+  S.alreadyCommitted = true;
+
+  return {
+    reply: buyLine,
+    stage: 'Payment',
+    needEvidence: false,
+    actions: ['invoice_request'] // чтобы фронт знал, что можно показать форму счёта/реквизитов
+  };
+}
+
+/* ──────────────────────────────────────────────────────────────
+   Поддержка: оценка «работы с возражениями» менеджера
+   ────────────────────────────────────────────────────────────── */
+
+/**
+ * Считаем «качество» текста менеджера по набору маркеров:
+ *  - эмпатия/негашение давления (понимаю/не настаиваю/спокойно)
+ *  - не про цену, а про ценность/репутацию/долгосрок
+ *  - предложение безопасного старта «с одного клиента/кандидата»
+ *  - «проверьте нашу работу», миссия/партнёрство/надежность
+ *  - мягкая развязка «не отвечайте сейчас… как будете готовы…»
+ *
+ * Итог: strong => +0.10 к вероятности покупки, weak => +0.03, none => +0.00
+ */
+function evaluateObjectionHandling(text=''){
+  const t = String(text).toLowerCase();
+
+  let score = 0;
+  const pats = [
+    /(понимаю|не\s*настаиваю|спокойно|без\s*давления)/i,
+    /(вопрос\s*не\s*в\s*цене|ценност|репутац|долгосроч)/i,
+    /(начн[её]м?\s*с\s*одн(ого|ого\s*клиент|ого\s*кандид))/i,
+    /(проверьте\s*работу|проверить\s*работу|мисси|партнер|партнёр|над[её]жн)/i,
+    /(не\s*отвечайте\s*сейчас|как\s*будете\s*готовы)/i
+  ];
+  for (const r of pats) if (r.test(t)) score++;
+
+  let level = 'none', bonus = 0;
+  if (score >= 4) { level = 'strong'; bonus = 0.10; }
+  else if (score >= 2) { level = 'weak'; bonus = 0.03; }
+  return { level, bonus, score };
+}
+
+/* ──────────────────────────────────────────────────────────────
+   Поддержка: «питч» на крипту от менеджера и принятие крипты Али
+   ────────────────────────────────────────────────────────────── */
+
+/**
+ * Сильный «питч» на крипту, если менеджер аргументирует:
+ *  - банк 4–7 рабочих дней (задержки)
+ *  - крипта 5 минут / «начать сразу»
+ *  - выгода по скорости процесса/регистраций/разрешений
+ */
+function evaluateCryptoPitch(text=''){
+  const t = String(text).toLowerCase();
+  let score = 0;
+  if (/(4-?7|4\s*–\s*7|4\s*до\s*7)\s*(рабочих\s*)?дн/i.test(t) || /bank.*(4|five).*(days|дн)/i.test(t)) score++;
+  if (/(5\s*мин|5\s*minutes|в\s*течение\s*5\s*мин)/i.test(t)) score++;
+  if (/(начать\s*сразу|незамедлительно|faster|быстрее|скорост|ускорит)/i.test(t)) score++;
+  let level = 'none';
+  if (score >= 2) level = 'strong';
+  else if (score === 1) level = 'weak';
+  return { level, score };
+}
+
+/**
+ * Решение принимать крипту или нет:
+ *  - базово Али не любит крипту
+ *  - вероятность согласия растёт с доверием и силой «питча»
+ */
+function decideCryptoAcceptance({ trust=0, cryptoFx={level:'none'}, rnd = Math.random } = {}){
+  let base = 0;
+  if (trust >= 100) base = 0.45;
+  else if (trust >= 90) base = 0.30;
+  else if (trust >= 80) base = 0.15;
+  else base = 0.05;
+
+  let bonus = 0;
+  if (cryptoFx.level === 'strong') bonus = 0.15;
+  else if (cryptoFx.level === 'weak') bonus = 0.05;
+
+  const p = Math.max(0, Math.min(0.75, base + bonus));
+  return rnd() < p;
+}
+
+/* ──────────────────────────────────────────────────────────────
+   Поддержка: выбор числа кандидатов и мелочи
+   ────────────────────────────────────────────────────────────── */
+
+function chooseCandidateCount(rnd = Math.random){
+  // Смещаем к малым числам (1–3 чаще)
+  const r = rnd();
+  if (r < 0.50) return 1;
+  if (r < 0.75) return 2;
+  if (r < 0.85) return 3;
+  if (r < 0.90) return 4;
+  if (r < 0.94) return 5;
+  if (r < 0.97) return 6 + Math.floor(rnd()*2); // 6–7
+  return 8 + Math.floor(rnd()*3); // 8–10
+}
+
+function pluralRu(n, one, few, many){
+  // Возвращаем окончание слова "кандидат" в творительном падеже уже включили сверху
+  // Здесь только суффиксы для эстетики текста покупки (просто «ом/ами/ами»).
+  const n10 = n % 10, n100 = n % 100;
+  if (n10 === 1 && n100 !== 11) return one;
+  if (n10 >= 2 && n10 <= 4 && (n100 < 12 || n100 > 14)) return few;
+  return many;
 }
 
 /* ──────────────────────────────────────────────────────────────
@@ -745,6 +1015,7 @@ app.get(['/apple-touch-icon.png','/apple-touch-icon-precomposed.png'], (req, res
 });
 
 app.get('/api/ping', (_, res) => res.json({ ok: true }));
+app.get('/api/version', (_,res) => res.json({ ok:true, name:'renovogo-llm-backend', version:'2025-09-16-11' })); // удобная проверка версии
 
 function sanitizeHistory(arr){
   return Array.isArray(arr) ? arr.slice(-50).map(h => ({
@@ -854,7 +1125,7 @@ app.post('/api/score', (req, res) => {
     ), 0, 100);
 
     if (trust < 80) bad.push('Для предметного обсуждения добавьте документы (Demand/Contract/Registry).');
-    bad.push('Не смешивайте сервисные платежи (€270/€300/€350/€500) с зарплатой работника — это разные вещи.');
+    bad.push('Не смешивайте сервисные платежи с зарплатой работника — это разные вещи.');
 
     res.json({ final, good, bad, trust, evidences: evidences.length });
   } catch (e) {
@@ -873,6 +1144,7 @@ app.post('/chat', async (req, res) => {
       evidences: Array.isArray(req.body?.evidences) ? req.body.evidences.map(normalizeEvidenceKey) : [],
       history: sanitizeHistory(req.body?.history)
     });
+
     const { trust, evidenceCount, result } = await runLLM({
       history: data.history,
       message: data.message,
@@ -880,6 +1152,7 @@ app.post('/chat', async (req, res) => {
       stage: data.stage,
       sessionId: data.sessionId
     });
+
     res.json({ ok: true, trust, evidenceCount, result });
   } catch (e) {
     logError(e, '/chat');
