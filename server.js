@@ -183,7 +183,7 @@ function seededRand(str=''){
   };
 }
 
-/* микропамять сессии */
+/* ПЕРСИСТЕНТНАЯ (в рамках процесса) ПАМЯТЬ СЕССИЙ */
 const sessionState = new Map();
 /*
   sessionState: Map<sid, {
@@ -353,8 +353,24 @@ function registrationAnswer(){
   return `По долгосрочному — ${REG_LONGTERM_MONTHS} мес назад; по сезонному — ${REG_SEASONAL_MONTHS} мес назад. Очереди нестабильные.`;
 }
 
-// [ALI-CLIENT] Greeting — коротко и тепло, если собеседник представился (без «не спешить»)
-function craftHumanGreeting({ base='', userText='' } = {}){
+/* ПРОГРЕСС СТАДИИ ОТ ДОКУМЕНТОВ (исключает повторы запросов) */
+function stageFromProofs(sid){
+  const hasDemand = hasEvidence(sid,'demand_letter');
+  const hasCoop   = hasEvidence(sid,'coop_contract_pdf');
+  const uniq      = evidenceCountUnique(sid);
+
+  if (hasDemand && !hasCoop) return 'Contract';
+  if (hasDemand && hasCoop && uniq >= 2) return 'Candidate'; // логично перейти к кандидатам
+  if (hasDemand && hasCoop && uniq >= 3) return 'Payment';   // при достаточном пакете можно обсуждать оплату
+  return hasDemand ? 'Contract' : 'Demand';
+}
+
+// Greeting — только на САМОМ первом ходе и если нет новых вложений
+function craftHumanGreeting({ base='', userText='', sid } = {}){
+  const S = getState(sid);
+  const isFirstTurn = (S.turn || 0) === 0;
+  if (!isFirstTurn) return String(base||'').trim(); // не приветствуем повторно
+
   const intro = /(меня зовут|я\s+(генераль|менедж|представител)|renovogo)/i.test(userText);
   if (intro) return 'Виктор, рад знакомству. Слушаю вас.';
   const variants = ['Здравствуйте.', 'Привет.', 'Добрый день.', 'Слушаю.'];
@@ -362,7 +378,7 @@ function craftHumanGreeting({ base='', userText='' } = {}){
   return forceMasculine(splitSentences(first)[0] || variants[Math.floor(Math.random()*variants.length)]);
 }
 
-// [ALI-CLIENT] Больше не переписываем в «Какие вакансии…» — оставляем как есть
+// Не переписываем вопросы — Али остаётся покупателем кандидатов
 function rewriteVacancyQuestionToSupplierRole(text=''){
   return String(text||'').trim();
 }
@@ -483,7 +499,6 @@ function chooseObjection({ sid, userText='', trust=0, uniqEvidence=0, hasDemand=
   const poolSlots = ['Сначала запись/подтверждение, потом вернусь к оплате.'];
   const poolDelay = ['Возьму время на внутреннюю проверку и подберу кандидатов.'];
 
-  // Новое: без явных триггеров и не на этапе Payment — не возражаем
   const hasTrigger = hasPriceTalk || mentionsPermit || mentionsSlots || mentionsPay || stage === 'Payment';
   if (!hasTrigger) return null;
 
@@ -514,6 +529,7 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   // 0) Нормализуем вход: редиректор «контракт работодателя» → B2B
   userText = redirectEmployerContractToCoop(userText);
 
+  // Какие новые вложения пришли в ЭТОМ сообщении — важно для анти-приветствия
   const inc = new Set((evidences || []).filter(k => !S.seenEvidences.has(k)));
 
   let reply = String(parsed.reply || '').trim();
@@ -532,10 +548,10 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     parsed.needEvidence = false;
   }
 
-  // Greeting — коротко и тепло, если собеседник представился
-  const isEarly = (history || []).length <= 2 || (!parsed.stage || parsed.stage === 'Greeting');
-  if (isEarly) {
-    reply = craftHumanGreeting({ base: reply, userText });
+  // Greeting только на самом первом ходе и только если нет новых вложений
+  const isFirstTurn = (S.turn === 1);
+  if (isFirstTurn && inc.size === 0 && (!parsed.stage || parsed.stage === 'Greeting')) {
+    reply = craftHumanGreeting({ base: reply, userText, sid });
     parsed.stage = 'Greeting';
   } else {
     reply = rewriteVacancyQuestionToSupplierRole(reply);
@@ -558,11 +574,20 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
 
   // Реактивная просьба документов — только если менеджер спросил «что нужно»
   if (/(что\s+нужно|what.*need|какие\s+документ\w*\s+нужн)/i.test(userText)) {
-    reply = 'Обычно достаточно описания вакансии (Demand) и нашего B2B-контракта.';
-    parsed.stage = hasEvidence(sid,'demand_letter') ? 'Contract' : 'Demand';
-    parsed.needEvidence = true;
-    setActions.add('ask_demands');
-    setActions.add('ask_coop_contract');
+    const hasDemandEv = hasEvidence(sid,'demand_letter');
+    const hasCoopEv   = hasEvidence(sid,'coop_contract_pdf');
+    if (!hasDemandEv || !hasCoopEv) {
+      reply = 'Обычно достаточно описания вакансии (Demand) и нашего B2B-контракта.';
+      parsed.stage = hasDemandEv ? 'Contract' : 'Demand';
+      parsed.needEvidence = true;
+      if (!hasDemandEv) setActions.add('ask_demands');
+      if (!hasCoopEv)   setActions.add('ask_coop_contract');
+    } else {
+      // уже всё есть — не просим повторно
+      reply = 'Документы есть. Давайте обсудим кандидатов.';
+      parsed.stage = 'Candidate';
+      parsed.needEvidence = false;
+    }
   }
 
   // Тихо фиксируем материалы (без «спасибо, получил»)
@@ -573,29 +598,24 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     bumpEvidence(sid, 'demand_letter');
     const facts = extractDemandFactsFromDetails(evidenceDetails || {});
     if (Object.keys(facts).length) setDemandFacts(sid, facts);
-
-    if (!hasEvidence(sid,'coop_contract_pdf')) {
-      parsed.stage = 'Contract';
-      parsed.needEvidence = true;
-      setActions.add('ask_coop_contract');
-    }
   }
-  if (inc.has('sample_contract_pdf')) {
-    bumpEvidence(sid, 'sample_contract_pdf');
-    if (!hasEvidence(sid,'coop_contract_pdf')) {
-      parsed.stage = 'Contract';
-      parsed.needEvidence = true;
-      setActions.add('ask_coop_contract');
-    }
-  }
-  if (inc.has('coop_contract_pdf')) {
-    bumpEvidence(sid, 'coop_contract_pdf');
-    parsed.stage = 'Contract';
-    parsed.needEvidence = false;
-  }
+  if (inc.has('sample_contract_pdf')) bumpEvidence(sid, 'sample_contract_pdf');
+  if (inc.has('coop_contract_pdf'))   bumpEvidence(sid, 'coop_contract_pdf');
   for (const key of ['visa_sample','presentation','video','website','company_registry','reviews','registry_proof','price_breakdown','slot_plan','invoice_template','nda']) {
     if (inc.has(key)) bumpEvidence(sid, key, evidenceDetails?.[key]);
   }
+
+  // После учёта вложений — вычисляем стадию от реальных доказательств
+  const stageByProofs = stageFromProofs(sid);
+  // Если модель поставила более «раннюю» стадию, поднимем до stageByProofs
+  const order = new Map([['Greeting',0],['Demand',1],['Contract',2],['Candidate',3],['Payment',4],['Closing',5]]);
+  if (!parsed.stage || (order.get(stageByProofs) > order.get(parsed.stage))) {
+    parsed.stage = stageByProofs;
+  }
+
+  // Никогда не предлагать заново то, что уже есть
+  if (hasEvidence(sid,'demand_letter')) setActions.delete('ask_demands');
+  if (hasEvidence(sid,'coop_contract_pdf')) setActions.delete('ask_coop_contract');
 
   // Оплата — только реактивно и без призывов
   if (/(банк|банковск|crypto|крипто|usdt|btc|eth|криптовалют)/i.test(userText) && /оплат|плат[её]ж|инвойс|сч[её]т/i.test(userText)) {
@@ -637,21 +657,17 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   reply = forceMasculine(reply);
   reply = limitSentences(reply, MAX_SENTENCES);
 
-  // Анти-луп
-  if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) {
-    reply = 'Ок.';
-  }
-
-  // Анти-повторы/кулдауны
+  // Анти-луп и анти-повторы
+  if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) reply = 'Ок.';
   reply = repetitionGuard(reply, sid);
   S.lastReply = reply;
 
-  // Финальные ворота: даже при высоком доверии НЕ инициируем «инвойс/счёт»
+  // Ворота: даже при высоком доверии НЕ инициируем «инвойс/счёт»
   const gatesOk = (trust >= 90 && evidenceCountUnique(sid) >= 2 && hasEvidence(sid,'coop_contract_pdf'));
   if (gatesOk) {
-    parsed.stage = 'Payment';
+    // переводим стадию вперёд, но без инициативы по оплате
+    if (order.get(parsed.stage) < order.get('Payment')) parsed.stage = 'Payment';
     parsed.needEvidence = false;
-    // не добавляем invoice_request — инициативы нет
   }
 
   parsed.reply = reply.trim();
