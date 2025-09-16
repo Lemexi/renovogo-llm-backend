@@ -124,70 +124,100 @@ function textSignals(text = '') {
 
 // ==== Основной расчёт ====
 export function computeTrust({ baseTrust = 20, evidences = [], history = [], lastUserText = '' }) {
-  let score = Math.max(0, Math.min(100, baseTrust));
+  let score = clamp01_100(baseTrust);
 
-  // Документальные признаки — считаем по уникальным ключам
+  // ===== 1) Документальные признаки (перевзвешенные) =====
+  // HARD = +8 за каждый, MEDIUM = +4, SUPPORT = +2
+  // Лёгкие анти-накрутки: считаем MED до 3шт, SUPPORT до 3шт
   const { uniq, hard, med, sup, uniqSet } = countKinds(evidences);
-
-  // Бонус за наличие ПОЛНОГО контракта (ключ ко входу в финализацию)
   const hasCoop = uniqSet.has('coop_contract_pdf') || uniqSet.has('contract_pdf');
 
-  score += hard * 18;                 // каждый тяжёлый — сильный прирост
-  score += Math.min(2, med) * 8;      // максимум +16 за медиум
-  score += Math.min(2, sup) * 3;      // максимум +6 за саппорт
-  if (hasCoop) score += 6;            // доп. доверие за полный контракт
+  score += hard * 8;
+  score += Math.min(3, med) * 4;
+  score += Math.min(3, sup) * 2;
+  if (hasCoop) score += 4; // полный контракт всё ещё даёт доп. доверие
 
-  // Разнообразие типов
-  if (uniq >= 3) score += 6;
-  if (uniq >= 5) score += 6;
+  // Разнообразие типов (стимулируем нести разные пруфы)
+  if (uniq >= 3) score += 3;
+  if (uniq >= 5) score += 3;
 
-  // Стадийные мягкие бонусы (только если есть реальные доки)
-  const stages = (history || []).map(h => (h.stage || '').toLowerCase());
+  // ===== 2) Стадии (мягкие бонусы, если есть реальные доки) =====
+  const stages = (history || []).map(h => String(h.stage || '').toLowerCase());
   const sawContractStage  = stages.includes('contract');
   const sawCandidateStage = stages.includes('candidate');
   const sawPaymentStage   = stages.includes('payment');
 
-  if (sawCandidateStage && (hard + med) > 0) score += 4;
-  if (sawContractStage  && hard > 0) score += 5;
+  if (sawCandidateStage && (hard + med) > 0) score += 2;
+  if (sawContractStage  && hard > 0)         score += 3;
 
-  // Тон последних сообщений
+  // ===== 3) Тональность и сигналы последней фразы =====
   const tone = toneFromHistory(history);
-  score += Math.min(4, tone.polite);  // небольшой плюс за вежливость
-  score += tone.press;                // минусы за давление
-  if (tone.obseq >= 2) score -= 4;    // чрезмерное «ок, как скажете»
+  score += Math.min(4, tone.polite); // небольшой плюс за вежливость
+  score += tone.press;               // минусы за давление
+  if (tone.obseq >= 2) score -= 3;   // чрезмерная угодливость снижает доверие слегка
 
-  // Сигналы из последней фразы пользователя
   const sig = textSignals(lastUserText || '');
   for (const r of sig.red) {
     if (r === 'crypto_upfront')                 score -= 25;
     else if (r === 'impossible_guarantee')      score -= 30;
-    else if (r === 'pressure')                  score -= 18;
+    else if (r === 'pressure')                  score -= 16; 
     else if (r === 'embassy_connections_claim') score -= 30;
     else if (r === 'unrealistic_timeline')      score -= 12;
-    else if (r === 'fee_salary_confusion')      score -= 12; // «€350 = зарплата» — нет
-    else if (r === 'requisites_from_demand')    score -= 10; // Demand ≠ реквизиты
+    else if (r === 'fee_salary_confusion')      score -= 12;
+    else if (r === 'requisites_from_demand')    score -= 10;
   }
-  if (sig.green.includes('mentions_bank_payment')) score += 3;
-  if (sig.green.includes('mentions_website'))      score += 2;
-  if (sig.green.includes('mentions_demand'))       score += 3;
-  if (sig.green.includes('mentions_contract'))     score += 3;
-  if (sig.green.includes('test_one_candidate'))    score += 3;
+  if (sig.green.includes('mentions_bank_payment')) score += 2;
+  if (sig.green.includes('mentions_website'))      score += 1;
+  if (sig.green.includes('mentions_demand'))       score += 2;
+  if (sig.green.includes('mentions_contract'))     score += 2;
+  if (sig.green.includes('test_one_candidate'))    score += 2;
 
-  // Нелинейные ворота (защита от «накрутки» мелочами)
-  // Gate 1: >50 требует минимум 1 тяжёлый пруф
-  if (score > 50 && hard < 1) score = 50;
+  // ===== 4) Микро-кредиты за «нормальный» диалог (без давления) =====
+  const micro = dialogMicroCredits(history);
+  score += Math.min(8, micro.uniqInfoKeysCount);
+  if (!micro.recentEarlyPayPressure) score += 1;
 
-  // Gate 2: >80 требует (2×HARD) ИЛИ (1×HARD + 1×MEDIUM)
+  // ===== 5) Нелинейные ворота (пересчитаны под новые веса) =====
+  if (score > 30 && hard < 1) score = 30; // Gate 1
   const passGate2 = (hard >= 2) || (hard >= 1 && med >= 1);
-  if (score > 80 && !passGate2) score = 80;
-
-  // Gate 3: >90 требует 2×HARD и отсутствие красных флагов
-  if (score > 90 && (hard < 2 || sig.red.length > 0)) score = 90;
-
-  // Наказание за ранний «Payment», если ворота не пройдены
-  if (sawPaymentStage && score < 90) score = Math.max(0, score - 10);
+  if (score > 60 && !passGate2) score = 60; // Gate 2
+  if (score > 75 && (hard < 2 || sig.red.length > 0)) score = 75; // Gate 3
+  if (sawPaymentStage && score < 75) score = Math.max(0, score - 8);
 
   // Финал
-  score = Math.round(Math.max(0, Math.min(100, score)));
-  return score;
+  return Math.round(clamp01_100(score));
+
+  // ===== Вспомогательные =====
+  function clamp01_100(x){ return Math.max(0, Math.min(100, Number(x) || 0)); }
+
+  function dialogMicroCredits(hist) {
+    const userMsgs = (hist || []).filter(m => String(m.role||'').toLowerCase()==='user').slice(-12);
+
+    const KEY_REGEXPS = {
+      name: /(как.*зовут|вас зовут|имя|name)/i,
+      office: /(офис|office|head\s*office|штаб|hq)/i,
+      location: /(где.*(наход|располож)|город|city|address|адрес)/i,
+      years: /(сколько.*лет|на рынке|лет в бизнесе|since\s+\d{4}|основан(ы|а)|founded)/i,
+      specialization: /(чем занимаетесь|специализац|на чём фокус|что делаете|services|услуги)/i,
+      registration: /(регистрац|ico|ičo|krs|regon|edrpou|uic|inn|nip|ico|номер компании|company number)/i,
+      team: /(штат|сотрудник|сколько человек|команда|headcount|staff)/i
+    };
+
+    const foundKeys = new Set();
+    for (const m of userMsgs) {
+      const t = (m.text || m.content || m.message || '').toString();
+      for (const [key,rx] of Object.entries(KEY_REGEXPS)) {
+        if (rx.test(t)) foundKeys.add(key);
+      }
+    }
+
+    const payRx = /(оплат|плат[её]ж|инвойс|сч[её]т| реквизит(ы)?)/i;
+    const earlyPayHits = userMsgs.slice(-6).filter(m => payRx.test((m.text||m.content||'')+'')).length;
+    const recentEarlyPayPressure = (earlyPayHits >= 2) && !passGate2;
+
+    return {
+      uniqInfoKeysCount: foundKeys.size,
+      recentEarlyPayPressure
+    };
+  }
 }
