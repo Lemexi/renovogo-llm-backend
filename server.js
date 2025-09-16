@@ -254,6 +254,14 @@ async function createChatWithRetry(payload, tries = 2) {
 function postRules({ parsed, trust, evidences, history, userText, sid, evidenceDetails }) {
   const S = getState(sid);
 
+  // === init state / scores / counters ===
+  S.meta   = S.meta   || {};
+  S.scores = S.scores || {};
+  if (typeof S.scores.trust !== 'number')   S.scores.trust = 50;
+  if (typeof S.scores.rapport !== 'number') S.scores.rapport = 60;
+  S.meta.totalUserMsgs = (S.meta.totalUserMsgs || 0) + 1;
+  S.seenEvidences = S.seenEvidences || new Set();
+
   // Новые пруфы ТОЛЬКО в этом запросе
   const inc = new Set((evidences || []).filter(k => !S.seenEvidences.has(k)));
 
@@ -278,13 +286,13 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   const askCandidates = /(сколько.*кандидат|кандидат(ов)?\s*(есть|готов|подад)|сколько человек будем подавать)/i.test(userText);
   if (askCandidates) {
     if (hasEvidence(sid,'demand_letter') && hasEvidence(sid,'coop_contract_pdf')) {
-      reply = 'Готов подать 1–2 кандидата на старт в Чехию. Остальные — после финализации и слотов.';
+      reply = 'Готов подать 1 кандидата на старт в Чехию. Остальное после того как проверю вашу работу.';
       parsed.stage = parsed.stage === 'Payment' ? 'Payment' : 'Candidate';
       parsed.needEvidence = false;
       setActions.add('invoice_request');
     } else {
       const miss = [];
-      if (!hasEvidence(sid,'demand_letter')) miss.push('Demand Letter');
+      if (!hasEvidence(sid,'demand_letter'))    miss.push('Demand Letter');
       if (!hasEvidence(sid,'coop_contract_pdf')) miss.push('полный контракт о сотрудничестве');
       reply = `Подтвержу точное число сразу после ${miss.join(' и ')}. Сейчас ориентир — 1–2 кандидата на старт.`;
       parsed.stage = 'Contract';
@@ -293,19 +301,66 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
     }
   }
 
-  // Не инициировать оплату при низком доверии
-  if (parsed.stage === 'Payment' && trust < 90) {
-    reply = 'К оплате перейдём после проверки документов и согласования контракта.';
-    parsed.stage = 'Contract';
-    parsed.needEvidence = true;
-    setActions.add('ask_demands'); setActions.add('ask_coop_contract'); setActions.add('ask_price_breakdown');
+  // ==== Hesitation lines (когда он не готов платить) ====
+  const HESITATION_LINES = [
+    'Понимаю, но для меня это пока дорого.',
+    'Пожалуйста, не давите. Если решу работать с вами — обязательно сообщу.',
+    'У меня пока нет кандидатов.',
+    'Сейчас занимаюсь подбором персонала под ваши запросы — напишу на следующей неделе.',
+    'Для меня это дорого, могу заплатить после визы.',
+    'Готов оплатить после разрешений на работу. Сейчас рисковать такой суммой не хочу.',
+    'Пока не уверен, что хочу работать именно с вами.',
+    'Я отпрвил Ваш запрос пратнерам, пока нет кандидатов.'
+  ];
+
+  // Псевдослучайный выбор без повторов подряд + анти-спам
+  function pickHesitation(state) {
+    if (!state.meta) state.meta = {};
+    const last = state.meta.lastHesitationLine;
+    const now  = Date.now();
+    const lastTs       = state.meta.lastHesitationTs || 0;
+    const lastMsgCount = state.meta.lastHesitationMsgCount || 0;
+    const canUseByTime = (now - lastTs) > 120000; // 2 мин
+    const canUseByMsgs = (state.meta.totalUserMsgs || 0) - lastMsgCount >= 4;
+    const canUse = canUseByTime || canUseByMsgs;
+
+    if (!canUse) {
+      return { line: 'Я еще работаю над этим, думаю через неделю вам отпишу', counted: false };
+    }
+
+    const pool = last ? HESITATION_LINES.filter(l => l !== last) : [...HESITATION_LINES];
+    const line = pool[Math.floor(Math.random() * pool.length)];
+
+    state.meta.lastHesitationLine = line;
+    state.meta.lastHesitationTs = now;
+    state.meta.lastHesitationMsgCount = (state.meta.totalUserMsgs || 0);
+
+    return { line, counted: true };
   }
 
-  // ====== Тихая фиксация приходящих материалов (без роботских «получил») ======
-  // Визитка — тихо сохраняем, ничего не говорим
+  // === Guard: не инициировать оплату при низком доверии ===
+  {
+    const currentTrust = Number.isFinite(trust) ? trust : (S.scores?.trust ?? 50);
+    if (parsed.stage === 'Payment' && currentTrust < 90) {
+      const picked = pickHesitation(S);
+      reply = picked.line;
+      parsed.stage = 'Contract';
+      parsed.needEvidence = true;
+      setActions.add('ask_demands');
+      setActions.add('ask_coop_contract');
+      setActions.add('ask_price_breakdown');
+      if (picked.counted) {
+        S.scores.rapport = Math.max(0, (S.scores.rapport || 0) - 10); // штраф только к раппорту
+      }
+    }
+  }
+
+  // ====== Тихая фиксация приходящих материалов (без «получил/спасибо») ======
+  // Визитка — тихо сохраняем
   if (inc.has('business_card') || (evidenceDetails && evidenceDetails.business_card)) {
     bumpEvidence(sid, 'business_card', evidenceDetails?.business_card);
   }
+
   // Demand Letter — тихо учитываем. Если ещё нет coop-контракта — мягко направляем на него
   if (inc.has('demand_letter')) {
     bumpEvidence(sid, 'demand_letter');
@@ -313,10 +368,10 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
       setActions.add('ask_coop_contract');
       parsed.stage = 'Contract';
       parsed.needEvidence = true;
-      // добавим короткую направляющую фразу, НО без «получил/спасибо»
-      reply = joinUniqueSentences([reply, 'Для проверки нужен полный контракт о сотрудничестве.']);
+      reply = joinUniqueSentences([reply, 'Пожалуйста, отправьте оффер или контракт с условиями сотрудничества.']);
     }
   }
+
   // Пример контракта — тихо учитываем; просим полный контракт
   if (inc.has('sample_contract_pdf')) {
     bumpEvidence(sid, 'sample_contract_pdf');
@@ -324,19 +379,20 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
       setActions.add('ask_coop_contract');
       parsed.stage = 'Contract';
       parsed.needEvidence = true;
-      reply = joinUniqueSentences([reply, 'Для финальной проверки нужен полный контракт о сотрудничестве.']);
+      reply = joinUniqueSentences([reply, 'Могли бы вы отправить контракт B2B?']);
     }
   }
+
   // Полный контракт — тихо учитываем; направляем к цене/инвойсу
   if (inc.has('coop_contract_pdf')) {
     bumpEvidence(sid, 'coop_contract_pdf');
     parsed.stage = 'Contract';
     parsed.needEvidence = false;
     setActions.add('ask_price_breakdown');
-    // без слова «получен» — просто двигаемся дальше
-    reply = joinUniqueSentences([reply, 'Контракт вижу. Могу перейти к разбивке цены и инвойсу.']);
+    reply = joinUniqueSentences([reply, 'Спасибо, ознакомился с условиями контракта. Пока не уверен, стоит работать или нет.']);
   }
-  // Прочие материалы — тихо учитываем, ничего не озвучиваем
+
+  // Прочие материалы — тихо учитываем
   for (const key of ['visa_sample','presentation','video','website','company_registry','reviews','registry_proof','price_breakdown','slot_plan','invoice_template','nda']) {
     if (inc.has(key)) bumpEvidence(sid, key, evidenceDetails?.[key]);
   }
@@ -352,14 +408,14 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   // ====== Санитария текста (убираем лишнее и «робота») ======
   reply = stripEmployerRequisitesRequests(reply); // не просим «реквизиты работодателя»
   reply = stripRequisitesFromDemand(reply);       // не просим «реквизиты из Demand»
-  reply = stripRoboticAcks(reply);                // убираем «спасибо/получил X»
+  reply = stripRoboticAcks(reply);                // убираем «спасибо/получил X» на каждое сообщение
   reply = cleanSales(reply);
   reply = forceMasculine(reply);
   reply = limitSentences(reply, MAX_SENTENCES);
 
   // Анти-луп
   if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) {
-    reply = 'Коротко: документы учёл. Готов подать 1–2 кандидата и перейти к инвойсу.';
+    reply = 'Коротко: документы учёл. Готов подать 2 кандидата и перейти к оплате.';
     parsed.stage = 'Payment';
     setActions.add('invoice_request');
   }
@@ -368,25 +424,25 @@ function postRules({ parsed, trust, evidences, history, userText, sid, evidenceD
   // Финальные ворота — контракт + ≥2 уникальных пруфа + trust≥90
   const uniqEvidenceCount = evidenceCountUnique(sid);
   const hasCoop = hasEvidence(sid,'coop_contract_pdf');
-  const gatesOk = (trust >= 90 && uniqEvidenceCount >= 2 && hasCoop);
+  const gatesOk = ( (Number.isFinite(trust) ? trust : S.scores.trust) >= 90 && uniqEvidenceCount >= 2 && hasCoop );
   if (gatesOk) {
     setActions.add('invoice_request');
     if (!/инвойс|сч[её]т|реквизит/i.test(reply)) {
-      reply = conciseJoin([reply, 'Готов перейти к финализации — пришлите реквизиты для инвойса.']);
+      reply = conciseJoin([reply, 'Пришлите реквизиты для оплаты.']);
     }
     parsed.stage = 'Payment';
     parsed.needEvidence = false;
   }
 
   parsed.reply = reply.trim();
-  parsed.suggestedActions = normalizeActions(Array.from(setActions));
+  parsed.suggestedActions = normalizeActions(Array.from(new Set([...(parsed.suggestedActions||[]), ...setActions])));
 
   // Если просим документы — stage не ниже Demand
   if (/(demand|контракт|документ|полный контракт|сотрудничеств)/i.test(parsed.reply) && (!parsed.stage || parsed.stage === 'Greeting')) {
     parsed.stage = 'Demand';
   }
 
-  return parsed;
+  return { parsed, trust: S.scores.trust };
 }
 
 // ---------- Вызов LLM ----------
@@ -419,8 +475,8 @@ async function runLLM({ history, message, evidences, stage, sessionId='default',
 
   if (!parsed) {
     const fb = stage === 'Payment'
-      ? 'К оплате перейдём после проверки документов.'
-      : 'Нужны Demand Letter и контракт о сотрудничестве. После проверки обсудим сроки и цену.';
+      ? 'Я не уверен что хочу с вами работать.'
+      : 'Мне надо подумать, если у вас есть другие вакансии поделитесь ими пожалуйста.';
     parsed = {
       reply: fb,
       confidence: clamp(trust, 0, 60),
