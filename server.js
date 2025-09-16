@@ -12,6 +12,25 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
+// ---------- CORS ----------
+const allowed = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
+    cb(new Error('Not allowed by CORS: ' + origin));
+  },
+  credentials: false
+}));
+
+// ---------- Groq ----------
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
+
 // ---------- PRICEBOOK ----------
 const PRICEBOOK = `
 [PRICEBOOK v1 — CZ/PL]
@@ -34,27 +53,8 @@ const PRICEBOOK = `
   • Free: verification of any contract received from other sources (send to help@renovogo.com)
   • Instructions: every PDF includes guidelines to verify authenticity.
   • All services strictly under Czech & EU law.
-  • Negotiation policy: client may bargain (e.g., “куплю за €300 после получения контракта”);
-    final decision depends on provided proofs and trust ≥ 90 with ≥ 2 hard proofs.
+  • Negotiation policy: client may bargain (“куплю контракт за €300, но после получения PDF”).
 `;
-// ---------- CORS ----------
-const allowed = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
-    cb(new Error('Not allowed by CORS: ' + origin));
-  },
-  credentials: false
-}));
-
-// ---------- Groq ----------
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-const MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
 
 // ---------- Schemas ----------
 const ChatSchema = z.object({
@@ -75,7 +75,8 @@ function buildMessages({ history = [], message, trust, evidences }) {
     role: 'system',
     content:
       SYSTEM_PROMPT +
-      `\n\n[Контекст-сервера]\nТекущий trust=${trust}. Доказательства=${JSON.stringify(evidences || [])}.\nПомни: отвечай СТРОГИМ JSON (см. формат в промпте).`
+      `\n\n[Контекст-сервера]\nТекущий trust=${trust}. Доказательства=${JSON.stringify(evidences || [])}.` +
+      `\n${PRICEBOOK}\nПомни: отвечай СТРОГИМ JSON (см. формат в промпте).`
   };
 
   const trimmed = history.slice(-12).map(h => ({
