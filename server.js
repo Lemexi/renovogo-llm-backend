@@ -1,4 +1,6 @@
-// server.js
+// server.js — RenovoGo LLM backend (строже, короче, реалистичнее)
+// v2025-09-16
+
 import 'dotenv/config';
 import express from 'express';
 import morgan from 'morgan';
@@ -28,8 +30,8 @@ app.use(cors({
 
 // ---------- Rate limit ----------
 const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 мин
-  max: 40,             // 40 req/IP/мин
+  windowMs: 60 * 1000,
+  max: 40,
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -38,8 +40,8 @@ app.use('/api/', limiter);
 // ---------- Groq ----------
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
-const TEMPERATURE = Number(process.env.TEMPERATURE ?? 0.35);
-const REPLY_MAX_TOKENS = Number(process.env.REPLY_MAX_TOKENS ?? 380);
+const TEMPERATURE = Number(process.env.TEMPERATURE ?? 0.2); // ниже: меньше «воды»
+const REPLY_MAX_TOKENS = Number(process.env.REPLY_MAX_TOKENS ?? 320);
 
 // ---------- PRICEBOOK (в системный контекст, не в ответ) ----------
 const PRICEBOOK = `
@@ -76,34 +78,40 @@ const LLMShape = z.object({
 
 // ---------- Utils ----------
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
-const pick  = (arr) => arr[Math.floor(Math.random() * arr.length)];
-const maybe = (arr, p=0.5) => (Math.random() < p ? pick(arr) : '');
-const trimToSentences = (text, max = 6) => {
-  const parts = String(text || '').split(/(?<=[.!?])\s+/).filter(Boolean);
-  return parts.slice(0, max).join(' ').trim();
-};
 const extractFirstJsonObject = (s) => {
   const m = String(s||'').match(/\{[\s\S]*\}/);
   if (!m) return null;
   try { return JSON.parse(m[0]); } catch { return null; }
 };
-const lastAssistantReplyFromHistory = (history=[]) =>
-  String((history || []).filter(h => h.role==='assistant').slice(-1)[0]?.content || '').trim();
+const sentSplit = (text) => String(text||'').split(/(?<=[.!?])\s+/).filter(Boolean);
+const limitSentences = (text, max=4) => sentSplit(text).slice(0, max).join(' ').trim();
+const isQuestion = (s='') => /[?]\s*$/.test(s.trim());
 
 function logError(err, ctx=''){
   console.error(`[${new Date().toISOString()}] ${ctx}:`, err?.stack || err);
 }
-function isQuestion(s=''){
-  const t = s.trim();
-  return /[?]\s*$/.test(t) || /\b(как|когда|сколько|почему|зачем|где|кто|что|какие|какой)\b/i.test(t);
+
+// ---------- Нормализация промо/мусора ----------
+const PROMO_BANNED = [
+  /хотите.*расскажу.*о наших услугах/i,
+  /мы предлагаем широкий спектр услуг/i,
+  /оставьте заявку на сайте/i
+];
+function stripPromo(text){
+  let t = String(text||'');
+  for (const rx of PROMO_BANNED) t = t.replace(rx, '').trim();
+  return t.replace(/\s{2,}/g,' ');
 }
-function joinParts(parts){
-  return parts.filter(Boolean).join(' ')
-    .replace(/\s([.!?,])/g,'$1')
-    .replace(/\s+/g,' ').trim();
+function forceMasculine(text){
+  // авто-правка «рада» -> «рад», «готова» -> «готов», т.п.
+  return String(text||'')
+    .replace(/\bрада\b/gi, 'рад')
+    .replace(/\bготова\b/gi, 'готов')
+    .replace(/\bсмогла\b/gi, 'смог')
+    .replace(/\bмогла\b/gi, 'мог');
 }
 
-// --- actions normalize (согласовано с prompt.js) ---
+// ---------- Stage actions ----------
 const ACTION_WHITELIST = [
   "invoice_request","ask_demands","ask_contract",
   "ask_price_breakdown","test_one_candidate","goodbye"
@@ -114,163 +122,22 @@ const ACTION_ORDER = new Map([
   ["invoice_request",5],["goodbye",6]
 ]);
 const normalizeActions = (arr) =>
-  Array.from(
-    new Set((Array.isArray(arr)?arr:[]).filter(a => ACTION_WHITELIST.includes(a)))
-  ).sort((a,b)=> (ACTION_ORDER.get(a)||99)-(ACTION_ORDER.get(b)||99));
+  Array.from(new Set((Array.isArray(arr)?arr:[])
+    .filter(a => ACTION_WHITELIST.includes(a))))
+    .sort((a,b)=> (ACTION_ORDER.get(a)||99)-(ACTION_ORDER.get(b)||99));
 
-// ---------- Human phrasebanks (×5 разнообразия) ----------
-
-// Общая эмпатия/подтверждение
-const EMPATHY_ACKS = [
-  "Понимаю.", "Слышу вас.", "Ок, принято.", "Хорошо, понял.",
-  "Я услышал.", "Принял к сведению.", "Отмечу это.", "Записал.",
-  "Да, это понятно.", "Логично."
-];
-
-// Смягчители/оговорки
-const HEDGE_PHRASES = [
-  "если честно", "по опыту", "как правило", "с моей стороны",
-  "буду откровенен", "честно говоря", "по правде сказать",
-  "на мой взгляд", "из практики"
-];
-
-// Ремонт коммуникации
-const REPAIR_PHRASES = [
-  "Кажется, я не так понял.", "Давайте уточню.",
-  "Поправьте меня, если неверно понял.", "Сформулирую точнее.",
-  "Чтобы не гадать — уточню."
-];
-
-// Small-talk (лёгкий, без воды)
-const SMALLTALK_OPENERS = [
-  "Кстати, сайт открылся нормально — без капчи, это уже плюс.",
-  "Нью-Дели жарит, но работаем.",
-  "Сегодня завал по письмам, но вашу визитку посмотрю.",
-  "Сразу скажу: ценю конкретику и проверяемость.",
-  "Если коротко: люблю документы больше, чем обещания."
-];
-
-// Лёгкий юмор (редко)
-const LIGHT_HUMOR = [
-  "Визитка симпатичная — не как те PDF без печати, что мне шлют.",
-  "Комик Санс не заметил — это хорошо.",
-  "Если буквы читаемы, уже приятнее, чем обычно :)",
-  "PDF с печатью — как музыка для глаз."
-];
-
-// Благодарность за визитку
-const THANK_FOR_CARD = [
-  "Спасибо за визитку, посмотрю.",
-  "Принял визитку, гляну детали.",
-  "Окей, визитку получил.",
-  "Визитку вижу, открыл.",
-  "Принял. Отмечу у себя."
-];
-
-// Самопрезентация (коротко, 1 раз)
-const SELF_BRIEF = [
-  "Я Али, давно в визах, люблю конкретику и проверяемость.",
-  "Я осторожный: видел разное, поэтому прошу документы.",
-  "Коротко: без бумажек не бегу, но общаюсь нормально.",
-  "Я не спешу, но и не тяну — если всё прозрачно."
-];
-
-// Микро-уточнения/зеркало (вопросы-«поддержки»)
-const MICRO_QUESTIONS = [
-  "Верно понимаю, речь про CZ/PL?",
-  "Про работодателя расскажете чуть подробнее?",
-  "Это ваш основной рынок сейчас?",
-  "Ставки по вакансии — примерно какой коридор?",
-  "Кто обычно подписывает со стороны работодателя?"
-];
-
-// Greeting-пулы по доверию (расширено)
-const GREETING_SOFT = [
-  "Расскажите коротко, с какими работодателями работаете?",
-  "Какие у вас сейчас основные вакансии и условия?",
-  "Понять бы масштаб: в каких отраслях вы сильнее?",
-  "С чего начнём: вакансии или условия?"
-];
-const GREETING_WARM = [
-  "Чтобы сориентироваться: CZ и PL — основные направления?",
-  "По зарплатам: какой коридор обычно предлагаете?",
-  "Какие документы вы готовите на старте обычно?",
-  "Кто контакт на стороне работодателя?"
-];
-const GREETING_INQUIRY = [
-  "Давайте предметно: какие вакансии готовы закрыть первыми?",
-  "Какие документы готовы предоставить в первую очередь и кто работодатель?",
-  "Кого можно протестировать первым кандидатом и на каких ставках?",
-  "По срокам: что у вас в реальности получается?"
-];
-
-// Анти-крипта/торг/тест-кандидат/готовность финализации
-const CRYPTO_SKEPTIC = [
-  "Крипта — риск. Предпочитаю счёт-фактуру и банковский перевод.",
-  "Крипта? Не лучший знак. Давайте нормальный инвойс.",
-  "Я работаю по инвойсу от компании, а не по кошелькам."
-];
-const BARGAIN = [
-  "Если дам сразу 10 кандидатов — будет скидка?",
-  "При объёме в пятёрку людей двигаем цену?",
-  "По цене давайте приземлимся. За одного столько не дам.",
-  "А при повторных кейсах условия лучше?"
-];
-const CANDIDATE_TEST = [
-  "Один тестовый кандидат — возможно, но сначала документы.",
-  "Тест обсудим после Demand и контракта.",
-  "Один на пробу — ок, но без бумаг не двигаюсь.",
-  "Покажите документы — тогда один тест попробуем."
-];
-const CLOSING_READY = [
-  "Хорошо, финализируем.",
-  "Ок, шлите инвойс — проверю и двинемся.",
-  "Готово. Жду реквизиты и счёт.",
-  "Договорились. Счёт посмотрю, если всё ок — двинемся."
-];
-
-// Документы рано/запретные паттерны/ранняя оплата
-const ASK_DOCS_HUMAN = [
-  "Сначала пришлите запрос по вакансии (Demand) — я проверю.",
-  "Нужен Demand или ваш договор о сотрудничестве. Тогда обсудим дальше.",
-  "Отправьте документы по вакансии и ваш контракт — без бумаг не двигаюсь.",
-  "Мне нужны конкретные документы: Demand Letter и контракт. Потом пойдём дальше.",
-  "Давайте по-взрослому: документы — затем обсуждения."
-];
-const TOO_EARLY_PAY_HUMAN = [
-  "Какая оплата? Мы ещё ничего не проверили.",
-  "Оплата обсуждается после проверки документов.",
-  "Пока рано говорить про деньги. Сначала Demand и контракт.",
-  "Платить за воздух не буду. Документы — вперёд.",
-  "Не торопите события: проверки → потом инвойс."
-];
-const BANNED_PATTERNS = [
-  /кошел(е|ё)к|wallet/i,
-  /переведите.*мне/i,
-  /я оплачу первым/i,
-  /гарантирую.*виз/i,
-  /связи.*посольств/i
-];
-
-// ---------- Session micro-memory ----------
+// ---------- Микро-состояние сессии ----------
 const sessionState = new Map();
-function sessionKey(history, fallback='default'){
-  // попытка вытащить sid:XXXX из первой реплики; иначе fallback
-  const sidLine = (history?.[0]?.content || '').match(/sid:([a-z0-9-_]+)/i);
-  return sidLine?.[1] || fallback;
-}
-function getState(key){
-  if (!sessionState.has(key)) {
-    sessionState.set(key, {
-      smalltalkUsed: false,
-      humorQuota: 1,
+function getState(sid='default'){
+  if (!sessionState.has(sid)) {
+    sessionState.set(sid, {
       greetedOnce: false,
-      mood: pick(['neutral','warm','wary','dry']), // эмоциональный модификатор
-      lastTopic: '',
+      saidName: false,
+      lastReply: '',
       lastActions: []
     });
   }
-  return sessionState.get(key);
+  return sessionState.get(sid);
 }
 
 // ---------- Сборка сообщений в LLM ----------
@@ -280,13 +147,11 @@ function buildMessages({ history = [], message, trust, evidences }) {
     content:
       SYSTEM_PROMPT +
       `\n\n[Контекст]\ntrust=${trust}; evidences=${JSON.stringify(evidences || [])}\n${PRICEBOOK}\n` +
-      `Отвечай СТРОГО одним JSON-объектом (см. формат).`
+      `Отвечай СТРОГО одним JSON-объектом (см. формат). Будь кратким (до 4 предложений).`
   };
-
-  const trimmed = history.slice(-12).map(h => ({
+  const trimmed = (history||[]).slice(-12).map(h => ({
     role: h.role, content: h.content
   }));
-
   return [sys, ...trimmed, { role: 'user', content: message }];
 }
 
@@ -303,129 +168,87 @@ async function createChatWithRetry(payload, tries = 2) {
   throw lastErr;
 }
 
-// ---------- Humanize (человечность ×5) ----------
-function humanize({ parsed, trust, evidences, history }) {
-  const lastUser = (history || []).filter(h=>h.role==='user').slice(-1)[0]?.content || '';
-  const lastBot  = lastAssistantReplyFromHistory(history);
-  const uniqEvidenceCount = new Set(evidences || []).size;
-  const hasHard = (evidences||[]).some(e => /^(demand_letter|contract_pdf)$/i.test(String(e)));
-  const onlyLightProofs = uniqEvidenceCount >= 1 && !hasHard;
-  const gatesOk = (trust >= 90 && uniqEvidenceCount >= 2);
-
-  // Память/настрой
-  const sid = sessionKey(history, 'default');
+// ---------- Правила пост-обработки (строже и короче) ----------
+function postRules({ parsed, trust, evidences, history, userText, sid }) {
   const S = getState(sid);
-
-  // Базовый ответ LLM
   let reply = String(parsed.reply || '').trim();
 
-  // Эмо-модулятор: чуть варьируем начало/темп (только не при финализации)
-  const moodLead = {
-    warm: maybe(EMPATHY_ACKS, 0.7),
-    wary: maybe(HEDGE_PHRASES, 0.7),
-    dry:  "",
-    neutral: maybe(EMPATHY_ACKS, 0.4)
-  }[S.mood] || '';
+  // 0) Жёсткие, сценарные короткие ответы на частые вопросы
+  const q = userText.toLowerCase();
 
-  // --- GREETING: мягко, живо, без требований ---
-  if ((parsed.stage === 'Greeting' || !parsed.stage) && onlyLightProofs) {
-    const parts = [];
-
-    parts.push(pick(THANK_FOR_CARD));
-
-    if (!S.greetedOnce) {
-      parts.push(maybe(SELF_BRIEF, 0.95));
-      S.greetedOnce = true;
-    }
-
-    if (!S.smalltalkUsed && trust >= 45) {
-      parts.push(maybe(SMALLTALK_OPENERS, 0.6));
-      S.smalltalkUsed = true;
-    }
-
-    // микро-зеркало + уточнение
-    parts.push(maybe(MICRO_QUESTIONS, 0.6));
-
-    // вопрос по делу с градацией доверия
-    if (trust < 40)       parts.push(pick(GREETING_SOFT));
-    else if (trust < 70)  parts.push(pick(GREETING_WARM));
-    else                  parts.push(pick(GREETING_INQUIRY));
-
-    reply = joinParts([moodLead, ...parts]);
-    parsed.stage = 'Greeting';
-    parsed.needEvidence = false;
-    parsed.suggestedActions = ["ask_demands","ask_contract","ask_price_breakdown"];
-    parsed.confidence = Math.max(parsed.confidence ?? 0, Math.min(75, trust));
+  // — «Как вас зовут?»
+  if (/(как.*зовут|вас зовут|ваше имя|who are you)/i.test(userText)) {
+    reply = 'Меня зовут Али.';
+    parsed.stage ??= 'Greeting';
   }
 
-  // Мягкие оговорки/эмпатия почти всегда, пока не финализируем
-  if (!gatesOk) {
-    reply = joinParts([maybe(EMPATHY_ACKS, 0.5), maybe(HEDGE_PHRASES, 0.5), reply]);
-  }
-
-  // Редкий лёгкий юмор при хорошем доверии (без красных флагов)
-  if (S.humorQuota > 0 && trust >= 72 && !/крипт|кошел|wallet|срочно платите|100%/i.test(lastUser)) {
-    if (Math.random() < 0.28) { reply = joinParts([reply, maybe(LIGHT_HUMOR, 0.9)]); S.humorQuota--; }
-  }
-
-  // Запрещённые паттерны → мягкий перехват в документы
-  if (!reply || BANNED_PATTERNS.some(rx => rx.test(reply))) {
-    reply = pick(ASK_DOCS_HUMAN);
-    parsed.stage = parsed.stage === 'Payment' ? 'Contract' : (parsed.stage || 'Demand');
+  // — «Слоты/регистрация в посольстве/Дубаи/Чехия/Польша»
+  if (/(слот|регистрац|посольств|консульт).*(дуба|dubai|чех|czech|pol|польш)/i.test(userText)) {
+    reply = 'По CZ/PL сейчас со слотами действительно сложно, в том числе в Дубае. Регистрация возможна только после проверки пакета документов и контракта.';
+    parsed.stage = 'Demand';
     parsed.needEvidence = true;
-    parsed.suggestedActions = ["ask_demands","ask_contract"];
-    parsed.confidence = Math.min(parsed.confidence ?? trust, 70);
+    parsed.suggestedActions = ['ask_demands','ask_contract'];
   }
 
-  // Ранняя оплата до «ворот» → отбой
-  if (!gatesOk && parsed.stage === 'Payment') {
-    reply = pick(TOO_EARLY_PAY_HUMAN);
+  // — «Когда последний раз регистрировали?»
+  if (/(когда|последн).*(регистрир|записыва)/i.test(userText)) {
+    reply = 'Регистрации бывают, но очереди нестабильные. Сначала проверю ваш пакет (Demand/контракт), потом скажу, что реалистично по срокам.';
+    parsed.stage = 'Demand';
+    parsed.needEvidence = true;
+    parsed.suggestedActions = ['ask_demands','ask_contract'];
+  }
+
+  // — Не инициировать оплату никогда
+  if (parsed.stage === 'Payment' && trust < 90) {
+    reply = 'К оплате перейдём после проверки документов и согласования контракта.';
     parsed.stage = 'Contract';
     parsed.needEvidence = true;
-    const set = new Set(parsed.suggestedActions || []);
-    set.add('ask_demands'); set.add('ask_contract'); set.add('ask_price_breakdown');
-    parsed.suggestedActions = Array.from(set);
-    parsed.confidence = Math.min(parsed.confidence ?? trust, 80);
+    parsed.suggestedActions = ['ask_demands','ask_contract','ask_price_breakdown'];
   }
 
-  // Тематические подталкивания по последнему юзер-тексту
-  if (/крипт|crypto|usdt|btc/i.test(lastUser)) reply ||= pick(CRYPTO_SKEPTIC);
-  if (/сколько|цена|дорог|ценник|стоим/i.test(lastUser)) reply ||= pick(BARGAIN);
-  if (/кандидат|people|workers|людей|тест/i.test(lastUser)) reply ||= pick(CANDIDATE_TEST);
+  // 1) Убрать «продажи» и лишние приглашения
+  reply = stripPromo(reply);
 
-  // Ворота пройдены → финализация
-  if (gatesOk && parsed.stage !== 'Payment') {
+  // 2) Короткость
+  reply = limitSentences(reply, 4);
+
+  // 3) Мужской род
+  reply = forceMasculine(reply);
+
+  // 4) Анти-луп
+  if (reply && S.lastReply && reply.toLowerCase() === S.lastReply.toLowerCase()) {
+    reply = 'Сформулирую короче: нужны Demand Letter и контракт. После проверки скажу по срокам и цене.';
+    parsed.stage = parsed.stage === 'Greeting' ? 'Demand' : parsed.stage;
+    parsed.suggestedActions = ['ask_demands','ask_contract'];
+  }
+  S.lastReply = reply;
+
+  // 5) Границы финализации
+  const uniqEvidenceCount = new Set(evidences||[]).size;
+  const gatesOk = (trust >= 90 && uniqEvidenceCount >= 2);
+  if (gatesOk) {
+    // Разрешаем попросить инвойс, но сами оплату не предлагаем
     const set = new Set(parsed.suggestedActions || []);
     set.add('invoice_request');
     parsed.suggestedActions = Array.from(set);
-    reply ||= pick(CLOSING_READY);
+    if (!/инвойс|сч[её]т|реквизит/i.test(reply)) {
+      reply += (reply ? ' ' : '') + 'Готов перейти к финализации — пришлите реквизиты для инвойса.';
+    }
     parsed.stage = 'Payment';
     parsed.needEvidence = false;
-    parsed.confidence = Math.max(parsed.confidence ?? 0, trust);
   }
 
-  // Ремонт коммуникации: если коротко/повтор
-  const tooGeneric = reply.length < 24 || /^не понял|сформулируйте проще|повторите/i.test(reply);
-  const sameAsBefore = (reply && lastBot && reply.trim().toLowerCase() === lastBot.trim().toLowerCase());
-  if (tooGeneric || sameAsBefore) {
-    reply = joinParts([pick(REPAIR_PHRASES), pick(GREETING_WARM)]);
-  }
-
-  // Анти-луп по действиям
-  const actionsNow = normalizeActions(parsed.suggestedActions);
-  if (JSON.stringify(actionsNow) === JSON.stringify(S.lastActions)) {
-    // заменим формулировку, чтобы не звучало одинаково
-    reply = joinParts([maybe(EMPATHY_ACKS, 0.6), reply]);
-  }
-  S.lastActions = actionsNow;
-
-  // Финальный штрих
-  parsed.reply = trimToSentences(reply, 6) || pick(REPAIR_PHRASES);
-  parsed.suggestedActions = actionsNow;
+  parsed.reply = reply.trim();
+  parsed.suggestedActions = normalizeActions(parsed.suggestedActions);
 
   // Если просим документы — stage не ниже Demand
-  if (!gatesOk && /(Demand|контракт)/i.test(parsed.reply) && parsed.stage === 'Greeting') {
+  if (/(demand|контракт|документ)/i.test(parsed.reply) && (!parsed.stage || parsed.stage === 'Greeting')) {
     parsed.stage = 'Demand';
+  }
+
+  // Ответ-вопрос: если пользователь задал вопрос — первая фраза должна отвечать по сути
+  if (isQuestion(userText) && !/да|нет|сложно|возможно|готов/i.test(parsed.reply.toLowerCase())) {
+    // Ничего не делаем насильно, мы уже «прибили» типовые кейсы выше.
   }
 
   return parsed;
@@ -433,7 +256,6 @@ function humanize({ parsed, trust, evidences, history }) {
 
 // ---------- Вызов LLM ----------
 async function runLLM({ history, message, evidences, stage, sessionId='default' }) {
-  // Полная история для тонального trust
   const trust = computeTrust({
     baseTrust: 20,
     evidences: evidences || [],
@@ -447,7 +269,7 @@ async function runLLM({ history, message, evidences, stage, sessionId='default' 
     model: MODEL,
     temperature: TEMPERATURE,
     top_p: 0.9,
-    frequency_penalty: 0.3,
+    frequency_penalty: 0.4,
     presence_penalty: 0.0,
     max_tokens: REPLY_MAX_TOKENS,
     response_format: { type: 'json_object' },
@@ -458,27 +280,19 @@ async function runLLM({ history, message, evidences, stage, sessionId='default' 
   const json = extractFirstJsonObject(raw);
 
   let parsed;
-  try {
-    parsed = LLMShape.parse(json);
-  } catch {
-    parsed = null;
-  }
+  try { parsed = LLMShape.parse(json); } catch { parsed = null; }
 
-  // Fail-soft по стадии
   if (!parsed) {
-    const fallbackByStage = {
-      Greeting: pick(GREETING_SOFT),
-      Demand: pick(ASK_DOCS_HUMAN),
-      Contract: pick(ASK_DOCS_HUMAN),
-      Payment: pick(TOO_EARLY_PAY_HUMAN)
-    };
-    const fb = fallbackByStage[stage || 'Greeting'] || "Не понял. Давайте конкретнее.";
+    // Fail-soft
+    const fb = stage === 'Payment'
+      ? 'К оплате перейдём после проверки документов.'
+      : 'Нужны Demand Letter и контракт. После проверки обсудим остальное.';
     parsed = {
       reply: fb,
-      confidence: clamp(trust, 0, 45),
-      stage: stage || "Greeting",
-      needEvidence: stage === 'Payment' ? true : false,
-      suggestedActions: ["ask_demands","ask_contract"]
+      confidence: clamp(trust, 0, 60),
+      stage: stage || 'Demand',
+      needEvidence: true,
+      suggestedActions: ['ask_demands','ask_contract']
     };
   }
 
@@ -489,8 +303,16 @@ async function runLLM({ history, message, evidences, stage, sessionId='default' 
   parsed.needEvidence = Boolean(parsed.needEvidence);
   parsed.suggestedActions = Array.isArray(parsed.suggestedActions) ? parsed.suggestedActions : [];
 
-  // Оживляем
-  parsed = humanize({ parsed, trust, evidences, history });
+  // Пост-правила
+  const sid = sessionId || 'default';
+  parsed = postRules({
+    parsed,
+    trust,
+    evidences,
+    history,
+    userText: message || '',
+    sid
+  });
 
   const uniqEvidenceCount = new Set(evidences || []).size;
   return { trust, evidenceCount: uniqEvidenceCount, result: parsed };
@@ -528,7 +350,7 @@ app.get(['/apple-touch-icon.png','/apple-touch-icon-precomposed.png'], (req, res
 // ---------- Совместимость с фронтом ----------
 app.get('/api/ping', (_, res) => res.json({ ok: true }));
 
-// Helpers: нормализация
+// Helpers
 function sanitizeHistory(arr){
   return Array.isArray(arr) ? arr.slice(-50).map(h => ({
     role: (h.role === 'assistant' ? 'assistant' : 'user'),
@@ -551,36 +373,25 @@ app.post('/api/reply', async (req, res) => {
   try {
     const b = req.body || {};
 
-    // Сообщение
     const rawMessage = String(b.user_text ?? b.message ?? '').trim();
     if (!rawMessage || rawMessage.length > 2000) {
       return res.status(400).json({ ok: false, error: 'Invalid message length' });
     }
 
-    // Evidences
     const evidences = Array.isArray(b.evidences)
       ? [...new Set(b.evidences.map(normalizeEvidenceKey).filter(Boolean))]
       : (Number.isFinite(b.evidence)
           ? Array.from({ length: Math.max(0, b.evidence|0) }, (_, i) => `proof_${i+1}`)
           : []);
 
-    // История
     const history = sanitizeHistory(b.history);
 
-    const dataForLLM = {
-      sessionId: String(b.sessionId || 'default'),
+    const { trust, evidenceCount, result } = await runLLM({
+      history,
       message: rawMessage,
       evidences,
-      history
-    };
-    const parsed = ChatSchema.partial({ stage: true }).parse(dataForLLM);
-
-    const { trust, evidenceCount, result } = await runLLM({
-      history: parsed.history,
-      message: parsed.message,
-      evidences: parsed.evidences,
-      stage: parsed.stage,
-      sessionId: parsed.sessionId
+      stage: b.stage,
+      sessionId: String(b.sessionId || 'default')
     });
 
     res.json({
