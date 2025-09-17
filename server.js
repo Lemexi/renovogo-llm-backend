@@ -784,6 +784,12 @@ function pluralRu(n, one, few, many){
   return many;
 }
 
+/**
+ * Принятие решения о «покупке».
+ * В режиме SIMULATOR_PAYMENT_SENT=1 Али говорит:
+ *   «Перевод отправлен за X кандидатов, принимайте деньги у себя — на счёту / в крипте».
+ * В боевом режиме просит реквизиты, как раньше.
+ */
 function applyAliPurchaseDecision({
   reply = '',
   stage = 'Greeting',
@@ -823,17 +829,27 @@ function applyAliPurchaseDecision({
   const candidates = chooseCandidateCount(rnd);
   const wantsCrypto = decideCryptoAcceptance({ trust, cryptoFx, rnd });
 
-  let buyLine = `Я готов с вами сотрудничать. Стартуем с ${candidates} кандидат${pluralRu(candidates, 'ом','ами','ами')}. `;
-  buyLine += wantsCrypto
-    ? 'Предоставьте, пожалуйста, криптовалютные реквизиты для оплаты.'
-    : 'Предоставьте, пожалуйста, банковский счёт для оплаты.';
+  const simMode = process.env.SIMULATOR_PAYMENT_SENT === '1';
+
+  let buyLine;
+  if (simMode) {
+    // ✅ Тренажёр: финал как ты хотел
+    const via = wantsCrypto ? 'в криптовалюте' : 'по банковскому счёту';
+    buyLine = `Перевод отправлен за ${candidates} кандидат${pluralRu(candidates,'а','ов','ов')}, принимайте деньги у себя ${wantsCrypto ? '(в крипто)' : '(на счёту)'}. Оплата ${via}.`;
+  } else {
+    // 🔒 Боевой режим: просим реквизиты
+    buyLine = `Я готов с вами сотрудничать. Стартуем с ${candidates} кандидат${pluralRu(candidates,'ом','ами','ами')}. `;
+    buyLine += wantsCrypto
+      ? 'Предоставьте, пожалуйста, криптовалютные реквизиты для оплаты.'
+      : 'Предоставьте, пожалуйста, банковский счёт для оплаты.';
+  }
 
   S.alreadyCommitted = true;
   return {
     reply: buyLine,
     stage: 'Payment',
     needEvidence: false,
-    actions: ['invoice_request']
+    actions: simMode ? [] : ['invoice_request']
   };
 }
 
@@ -895,6 +911,7 @@ async function runLLM({ history, message, evidences, stage, sessionId='default',
   parsed.needEvidence = Boolean(parsed.needEvidence);
   parsed.suggestedActions = Array.isArray(parsed.suggestedActions) ? parsed.suggestedActions : [];
 
+  // Пост-обработка (анти-повторы, стадии, и т.п.)
   parsed = postRules({
     parsed,
     trust,
@@ -904,6 +921,23 @@ async function runLLM({ history, message, evidences, stage, sessionId='default',
     sid: sessionId || 'default',
     evidenceDetails
   });
+
+  // ★ ХУК «ПОКУПКИ»: даём шанс на финал «Перевод отправлен…» в тренажёрном режиме
+  const decision = applyAliPurchaseDecision({
+    reply: parsed.reply,
+    stage: parsed.stage,
+    trust,
+    evidences,
+    userText: safeMessage,
+    sid: sessionId || 'default'
+  });
+
+  if (decision) {
+    parsed.reply = decision.reply;
+    parsed.stage = decision.stage;
+    parsed.needEvidence = !!decision.needEvidence;
+    parsed.suggestedActions = normalizeActions([...(parsed.suggestedActions||[]), ...(decision.actions||[])]);
+  }
 
   return { trust, evidenceCount: evidenceCountUnique(sessionId), result: parsed };
 }
